@@ -17,11 +17,16 @@
 #include <tchar.h>
 #include <shellapi.h>
 
+#include "slate_doc.h"
+
 // Application constants
 #define APP_NAME            _T("Slate")
 #define WINDOW_CLASS_NAME   _T("SlateClass")
 #define MAX_FILE_PATH       260
 #define STATUS_BAR_HEIGHT   20
+
+#define IDC_EDITOR          5001
+#define IDC_STATUSBAR       5002
 
 // Menu command IDs
 #define ID_FILE_NEW         1001
@@ -30,11 +35,13 @@
 #define ID_FILE_SAVE_AS     1004
 #define ID_FILE_EXIT        1005
 
-#define ID_EDIT_CUT         2001
-#define ID_EDIT_COPY        2002
-#define ID_EDIT_PASTE       2003
-#define ID_EDIT_DELETE      2004
-#define ID_EDIT_SELECT_ALL  2005
+#define ID_EDIT_UNDO        2001
+#define ID_EDIT_REDO        2002
+#define ID_EDIT_CUT         2003
+#define ID_EDIT_COPY        2004
+#define ID_EDIT_PASTE       2005
+#define ID_EDIT_DELETE      2006
+#define ID_EDIT_SELECT_ALL  2007
 
 #define ID_HELP_HELP        3001
 #define ID_HELP_ABOUT       3002
@@ -49,6 +56,7 @@ typedef struct {
     HWND hwnd;
     HWND hEdit;
     HWND hStatus;
+    SlateDoc* pDoc;      // NEW: Pointer to the piece-table document
     TCHAR szFileName[MAX_FILE_PATH];
     BOOL bIsModified;
     BOOL bIsInsertMode;

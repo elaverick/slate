@@ -14,7 +14,7 @@ cl /nologo /W4 /MD /DWIN32 /D_WINDOWS /DUNICODE /D_UNICODE ^
    /D_CRT_SECURE_NO_WARNINGS ^
    /I"%SRC_DIR%" ^
    /Fe"%OUT_DIR%\%EXE_NAME%" ^
-   "%SRC_DIR%\main.c" "%SRC_DIR%\slate.c" ^
+   "%SRC_DIR%\main.c" "%SRC_DIR%\slate_doc.c" "%SRC_DIR%\slate_view.c" "%SRC_DIR%\slate.c" ^
    /link /SUBSYSTEM:WINDOWS ^
          user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib
 
