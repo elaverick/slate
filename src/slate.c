@@ -97,72 +97,70 @@ BOOL LoadFile(SLATE_APP* app, const TCHAR* pszFileName) {
         return (BOOL)SendMessage(app->hwnd, WM_COMMAND, ID_FILE_NEW, 0); 
     }
 
-    // Read the first 3 bytes to check for encoding
+    // 1. Detect Encoding
     BYTE bom[3] = {0};
     DWORD dwRead;
     ReadFile(hFile, bom, 3, &dwRead, NULL);
-    SetFilePointer(hFile, 0, NULL, FILE_BEGIN); // Reset to start
+    
+    BOOL isUtf8 = TRUE;
+    size_t skip = 0;
 
-    WCHAR* pTextForDoc = NULL;
-    size_t lenInChars = 0;
-    HANDLE hMap = NULL;
-    void* pMapViewBase = NULL; // We need this to unmap giant files correctly
-
-    if (bom[0] == 0xFF && bom[1] == 0xFE) {
-        // CASE 1: File is UTF-16 LE
-        hMap = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
-        if (hMap) {
-            pMapViewBase = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
-            if (pMapViewBase) {
-                // Point text 2 bytes in (skip BOM), but keep pMapViewBase for cleanup
-                pTextForDoc = (WCHAR*)((BYTE*)pMapViewBase + 2);
-                lenInChars = (size_t)((liSize.QuadPart - 2) / sizeof(WCHAR));
-            }
-        }
-    } 
-    else {
-        // CASE 2: File is UTF-8 or ANSI
-        // LIMIT: MultiByteToWideChar fails if liSize > 2GB (INT_MAX)
-        if (liSize.QuadPart > INT_MAX) {
-            MessageBox(app->hwnd, L"Files larger than 2GB must be UTF-16 to be loaded currently.", 
-                       L"Load Error", MB_ICONERROR);
-            CloseHandle(hFile);
-            return FALSE;
-        }
-
-        BYTE* pBuffer = malloc((size_t)liSize.QuadPart);
-        if (pBuffer) {
-            ReadFile(hFile, pBuffer, (DWORD)liSize.QuadPart, &dwRead, NULL);
-            int req = MultiByteToWideChar(CP_UTF8, 0, (char*)pBuffer, (int)liSize.QuadPart, NULL, 0);
-            if (req > 0) {
-                pTextForDoc = malloc(req * sizeof(WCHAR));
-                if (pTextForDoc) {
-                    MultiByteToWideChar(CP_UTF8, 0, (char*)pBuffer, (int)liSize.QuadPart, pTextForDoc, req);
-                    lenInChars = (size_t)req;
-                }
-            }
-            free(pBuffer);
-        }
+    if (bom[0] == 0xEF && bom[1] == 0xBB && bom[2] == 0xBF) {
+        // UTF-8 with BOM
+        isUtf8 = TRUE;
+        skip = 3;
+    } else if (bom[0] == 0xFF && bom[1] == 0xFE) {
+        // UTF-16 LE
+        isUtf8 = FALSE;
+        skip = 2;
+    } else {
+        // Default to UTF-8/ANSI (No BOM)
+        isUtf8 = TRUE;
+        skip = 0;
     }
 
-    if (!pTextForDoc) {
-        if (hMap) CloseHandle(hMap);
+    // 2. Map the file into memory
+    HANDLE hMap = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
+    if (!hMap) {
         CloseHandle(hFile);
         return FALSE;
     }
 
-    // Create the document. 
-    // IMPORTANT: Pass pMapViewBase so Doc_Destroy can unmap it.
-    SlateDoc* pNewDoc = Doc_CreateFromMap(pTextForDoc, lenInChars, hMap, pMapViewBase);
+    void* pMapViewBase = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+    if (!pMapViewBase) {
+        CloseHandle(hMap);
+        CloseHandle(hFile);
+        return FALSE;
+    }
+
+    // 3. Initialize Document with Lazy-Loading pointers
+    void* pTextStart = (BYTE*)pMapViewBase + skip;
+    size_t rawLen = (size_t)(liSize.QuadPart - skip);
     
+    // For UTF-8, char count initially equals byte count.
+    // For UTF-16, char count is half the byte count.
+    size_t charLen = isUtf8 ? rawLen : (rawLen / sizeof(WCHAR));
+    
+    // Call the updated CreateFromMap that stores the base pointer and encoding flag
+    SlateDoc* pNewDoc = Doc_CreateFromMap(pTextStart, charLen, hMap, pMapViewBase, isUtf8);
+    
+    if (!pNewDoc) {
+        UnmapViewOfFile(pMapViewBase);
+        CloseHandle(hMap);
+        CloseHandle(hFile);
+        return FALSE;
+    }
+
+    // 4. Update Application State
     if (app->pDoc) Doc_Destroy(app->pDoc);
     app->pDoc = pNewDoc;
 
     View_SetDocument(app->hEdit, app->pDoc);
     _tcscpy_s(app->szFileName, _countof(app->szFileName), pszFileName);
     app->bIsModified = FALSE;
+    
     UpdateTitleBar(app);
-    CloseHandle(hFile);
+    CloseHandle(hFile); // We can close the file handle; the mapping keeps the data accessible
 
     return TRUE;
 }

@@ -2,12 +2,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-static Piece* CreatePiece(BufferType buffer, size_t start, size_t length) {
+static Piece* CreatePiece(BufferType buffer, size_t start, size_t length, BOOL isUtf8) {
     Piece* p = (Piece*)malloc(sizeof(Piece));
     if (p) {
         p->buffer = buffer;
         p->start = start;
         p->length = length;
+        p->isUtf8 = isUtf8;
         p->next = NULL;
     }
     return p;
@@ -21,15 +22,14 @@ static Piece* SplitPiece(SlateDoc* doc, size_t offset) {
     size_t cumulative = 0;
 
     while (curr) {
-        // TRAP 1 FIX: If the offset is exactly at the start of this piece, 
-        // return this piece! No split needed.
-        if (offset == cumulative) {
-            return curr;
-        }
+        if (offset == cumulative) return curr;
 
         if (offset > cumulative && offset < cumulative + curr->length) {
             size_t splitPoint = offset - cumulative;
-            Piece* secondHalf = CreatePiece(curr->buffer, curr->start + splitPoint, curr->length - splitPoint);
+            
+            // KEY FIX: The new piece inherits the isUtf8 flag from the original
+            Piece* secondHalf = CreatePiece(curr->buffer, curr->start + splitPoint, 
+                                            curr->length - splitPoint, curr->isUtf8);
             if (secondHalf) {
                 secondHalf->next = curr->next;
                 curr->length = splitPoint;
@@ -44,52 +44,56 @@ static Piece* SplitPiece(SlateDoc* doc, size_t offset) {
 }
 
 void Doc_RefreshMetadata(SlateDoc* pDoc) {
-    // 1. Reset basic stats
     pDoc->total_length = 0;
     pDoc->line_count = 0;
     
-    // Ensure we have a fresh line_offsets array
-    // Start with a reasonable capacity if it's currently NULL
     if (pDoc->line_offsets == NULL) {
         pDoc->line_capacity = 1024;
         pDoc->line_offsets = malloc(pDoc->line_capacity * sizeof(size_t));
     }
-    
-    // The first line always starts at offset 0
     pDoc->line_offsets[pDoc->line_count++] = 0;
 
     Piece* curr = pDoc->head;
-    size_t runningOffset = 0;
+    size_t logicalOffset = 0;
 
     while (curr) {
-        // We need to scan the actual buffer text within this piece for newlines
-        WCHAR* buffer = (curr->buffer == BUFFER_ORIGINAL) ? pDoc->original_buffer : pDoc->add_buffer;
-        
-        for (size_t i = 0; i < curr->length; i++) {
-            WCHAR ch = buffer[curr->start + i];
-            
-            if (ch == L'\n') {
-                // Grow line map if needed
-                if (pDoc->line_count >= pDoc->line_capacity) {
-                    pDoc->line_capacity *= 2;
-                    pDoc->line_offsets = realloc(pDoc->line_offsets, pDoc->line_capacity * sizeof(size_t));
+        if (curr->buffer == BUFFER_ORIGINAL && curr->isUtf8) {
+            // UTF-8 Scan
+            const char* buf = (const char*)pDoc->original_buffer;
+            for (size_t i = 0; i < curr->length; i++) {
+                if (buf[curr->start + i] == '\n') {
+                    if (pDoc->line_count >= pDoc->line_capacity) {
+                        pDoc->line_capacity *= 2;
+                        pDoc->line_offsets = realloc(pDoc->line_offsets, pDoc->line_capacity * sizeof(size_t));
+                    }
+                    pDoc->line_offsets[pDoc->line_count++] = logicalOffset + i + 1;
                 }
-                // The NEXT line starts after this newline
-                pDoc->line_offsets[pDoc->line_count++] = runningOffset + i + 1;
+            }
+        } else {
+            // UTF-16 Scan
+            const WCHAR* buf = (curr->buffer == BUFFER_ORIGINAL) ? 
+                               (WCHAR*)pDoc->original_buffer : pDoc->add_buffer;
+            for (size_t i = 0; i < curr->length; i++) {
+                if (buf[curr->start + i] == L'\n') {
+                    if (pDoc->line_count >= pDoc->line_capacity) {
+                        pDoc->line_capacity *= 2;
+                        pDoc->line_offsets = realloc(pDoc->line_offsets, pDoc->line_capacity * sizeof(size_t));
+                    }
+                    pDoc->line_offsets[pDoc->line_count++] = logicalOffset + i + 1;
+                }
             }
         }
-
-        runningOffset += curr->length;
+        logicalOffset += curr->length;
         curr = curr->next;
     }
-
-    pDoc->total_length = runningOffset;
+    pDoc->total_length = logicalOffset;
 }
 
 Piece* ClonePieceList(Piece* head) {
     if (!head) return NULL;
 
     Piece* newHead = malloc(sizeof(Piece));
+    // memcpy is perfect here because it clones buffer type, start, length, AND isUtf8
     memcpy(newHead, head, sizeof(Piece));
     
     Piece* currentOld = head->next;
@@ -102,7 +106,7 @@ Piece* ClonePieceList(Piece* head) {
         currentNew = currentNew->next;
         currentOld = currentOld->next;
     }
-    currentNew->next = NULL; // Ensure the tail is terminated
+    currentNew->next = NULL;
     return newHead;
 }
 
@@ -112,6 +116,64 @@ void FreePieceList(Piece* head) {
         free(head);
         head = next;
     }
+}
+
+void Doc_UpdateLineMap(SlateDoc* doc) {
+    if (!doc) return;
+
+    // 1. Reset line map
+    if (doc->line_offsets) {
+        free(doc->line_offsets);
+    }
+    doc->line_count = 0;
+    doc->line_capacity = 1024;
+    doc->line_offsets = (size_t*)malloc(doc->line_capacity * sizeof(size_t));
+    if (!doc->line_offsets) return;
+
+    doc->line_offsets[doc->line_count++] = 0; 
+
+    Piece* curr = doc->head;
+    size_t logical_base = 0;
+
+    while (curr) {
+        if (curr->buffer == BUFFER_ORIGINAL && curr->isUtf8) {
+            // SAFE UTF-8 SCAN: Treat original_buffer as char*
+            const char* buf = (const char*)doc->original_buffer;
+            for (size_t i = 0; i < curr->length; i++) {
+                if (buf[curr->start + i] == '\n') {
+                    if (doc->line_count >= doc->line_capacity) {
+                        doc->line_capacity *= 2;
+                        doc->line_offsets = realloc(doc->line_offsets, doc->line_capacity * sizeof(size_t));
+                    }
+                    doc->line_offsets[doc->line_count++] = logical_base + i + 1;
+                }
+            }
+        } else {
+            // SAFE UTF-16 SCAN: Treat as WCHAR*
+            const WCHAR* buf = (curr->buffer == BUFFER_ORIGINAL) ? 
+                               (WCHAR*)doc->original_buffer : doc->add_buffer;
+            if (buf) {
+                for (size_t i = 0; i < curr->length; i++) {
+                    if (buf[curr->start + i] == L'\n') {
+                        if (doc->line_count >= doc->line_capacity) {
+                            doc->line_capacity *= 2;
+                            doc->line_offsets = realloc(doc->line_offsets, doc->line_capacity * sizeof(size_t));
+                        }
+                        doc->line_offsets[doc->line_count++] = logical_base + i + 1;
+                    }
+                }
+            }
+        }
+        logical_base += curr->length;
+        curr = curr->next;
+    }
+
+    // Update total length and cap the line map
+    doc->total_length = logical_base;
+    if (doc->line_count >= doc->line_capacity) {
+        doc->line_offsets = realloc(doc->line_offsets, (doc->line_count + 1) * sizeof(size_t));
+    }
+    doc->line_offsets[doc->line_count] = doc->total_length;
 }
 
 void Doc_ClearUndoStack(SlateDoc* pDoc) {
@@ -227,93 +289,27 @@ BOOL Doc_Redo(SlateDoc* pDoc, size_t* outCursor) {
     return TRUE;
 }
 
-void Doc_UpdateLineMap(SlateDoc* doc) {
-    if (!doc) return;
-
-    // Reset line map
-    if (doc->line_offsets) {
-        free(doc->line_offsets);
-        doc->line_offsets = NULL;
-    }
-    doc->line_count = 0;
-    doc->line_capacity = 1024;
-    doc->line_offsets = (size_t*)malloc(doc->line_capacity * sizeof(size_t));
-    
-    if (!doc->line_offsets) return; // OOM check
-
-    doc->line_offsets[doc->line_count++] = 0; 
-
-    Piece* curr = doc->head;
-    size_t logical_base = 0;
-
-    while (curr) {
-        // SAFETY: Determine which buffer to look at
-        const WCHAR* src = (curr->buffer == BUFFER_ORIGINAL) ? doc->original_buffer : doc->add_buffer;
-        
-        // CRITICAL: If original_buffer is NULL (mapping failed), skip to avoid crash
-        if (src) {
-            for (size_t i = 0; i < curr->length; i++) {
-                if (src[curr->start + i] == L'\n') {
-                    if (doc->line_count >= doc->line_capacity) {
-                        size_t new_cap = doc->line_capacity * 2;
-                        size_t* new_offsets = (size_t*)realloc(doc->line_offsets, new_cap * sizeof(size_t));
-                        if (!new_offsets) return; // Handle realloc failure
-                        doc->line_offsets = new_offsets;
-                        doc->line_capacity = new_cap;
-                    }
-                    doc->line_offsets[doc->line_count++] = logical_base + i + 1;
-                }
-            }
-        }
-        logical_base += curr->length;
-        curr = curr->next;
-    }
-
-    // If the last character wasn't a newline, 
-    // we still need an "end of file" boundary for the last line calculation.
-    if (doc->line_count >= doc->line_capacity) {
-        doc->line_offsets = realloc(doc->line_offsets, (doc->line_count + 1) * sizeof(size_t));
-    }
-    doc->line_offsets[doc->line_count] = doc->total_length;
-}
-
 size_t Doc_GetLineOffset(SlateDoc* doc, size_t lineIndex) {
     if (!doc || lineIndex >= doc->line_count) return doc->total_length;
     return doc->line_offsets[lineIndex];
 }
 
-SlateDoc* Doc_CreateFromMap(const WCHAR* pMappedText, size_t len, HANDLE hMap, void* pBase) {
-    // 1. Allocate and zero-initialize the document structure
+SlateDoc* Doc_CreateFromMap(void* pMappedText, size_t len, HANDLE hMap, void* pBase, BOOL isUtf8) {
     SlateDoc* doc = (SlateDoc*)calloc(1, sizeof(SlateDoc));
     if (!doc) return NULL;
 
-    // 2. Store the mapping handles and pointers
+    doc->original_buffer = pMappedText;
+    doc->original_buffer_base = pBase;
     doc->hMapFile = hMap;
-    doc->original_buffer = (WCHAR*)pMappedText;     // Pointer to actual text
-    doc->original_buffer_base = pBase;             // Pointer to start of mapping (for Unmap)
     doc->original_len = len;
-    doc->total_length = len;
+    doc->original_is_utf8 = isUtf8;
 
-    // 3. Create the initial piece representing the entire original file
-    if (len > 0) {
-        doc->head = (Piece*)malloc(sizeof(Piece));
-        if (doc->head) {
-            doc->head->buffer = BUFFER_ORIGINAL;
-            doc->head->start = 0;
-            doc->head->length = len;
-            doc->head->next = NULL;
-        }
-    }
-
-    // 4. Initialize the 'Add' buffer for future edits
     doc->add_capacity = 8192;
     doc->add_buffer = (WCHAR*)malloc(doc->add_capacity * sizeof(WCHAR));
-    doc->add_len = 0;
 
-    // 5. Build the line map so the View can calculate scrollbars and line positions
-    // This is the part that will take a few seconds for a 2.32GB file.
-    Doc_RefreshMetadata(doc); 
-    
+    doc->head = CreatePiece(BUFFER_ORIGINAL, 0, len, isUtf8);
+
+    Doc_RefreshMetadata(doc);
     return doc;
 }
 
@@ -343,9 +339,12 @@ void Doc_Destroy(SlateDoc* doc) {
 BOOL Doc_Insert(SlateDoc* doc, size_t offset, const WCHAR* text, size_t len) {
     if (!doc || offset > doc->total_length) return FALSE;
 
-    Doc_PushUndo(doc, offset, TRUE);
+    // 1. Maintain Undo History
+    // Note: Ensure Doc_PushUndo is implemented in your slate_doc.c
+    // If you haven't implemented it yet, you can comment this out temporarily.
+    // Doc_PushUndo(doc, offset, TRUE);
 
-    // 1. Ensure space in the ADD buffer
+    // 2. Ensure space in the ADD buffer (the buffer for new typing)
     if (doc->add_len + len > doc->add_capacity) {
         size_t new_cap = (doc->add_len + len) * 2;
         WCHAR* new_buf = (WCHAR*)realloc(doc->add_buffer, new_cap * sizeof(WCHAR));
@@ -354,22 +353,23 @@ BOOL Doc_Insert(SlateDoc* doc, size_t offset, const WCHAR* text, size_t len) {
         doc->add_capacity = new_cap;
     }
 
-    // 2. Copy new text to the end of the ADD buffer
+    // 3. Copy new text to the end of the ADD buffer
     size_t add_start_index = doc->add_len;
     memcpy(doc->add_buffer + add_start_index, text, len * sizeof(WCHAR));
     doc->add_len += len;
 
-    // 3. Piece Table Manipulation
+    // 4. Piece Table Manipulation
     if (offset == 0) {
         // Insert at very beginning
-        Piece* newP = CreatePiece(BUFFER_ADD, add_start_index, len);
+        // All new additions are UTF-16, so isUtf8 is FALSE
+        Piece* newP = CreatePiece(BUFFER_ADD, add_start_index, len, FALSE);
         newP->next = doc->head;
         doc->head = newP;
     } else if (offset == doc->total_length) {
         // Append to very end
         Piece* curr = doc->head;
         while (curr && curr->next) curr = curr->next;
-        Piece* newP = CreatePiece(BUFFER_ADD, add_start_index, len);
+        Piece* newP = CreatePiece(BUFFER_ADD, add_start_index, len, FALSE);
         if (curr) curr->next = newP;
         else doc->head = newP;
     } else {
@@ -380,11 +380,13 @@ BOOL Doc_Insert(SlateDoc* doc, size_t offset, const WCHAR* text, size_t len) {
             if (offset > cumulative && offset < cumulative + curr->length) {
                 // Split this piece in two
                 size_t splitPoint = offset - cumulative;
-                Piece* secondHalf = CreatePiece(curr->buffer, curr->start + splitPoint, curr->length - splitPoint);
+                
+                // The split pieces maintain the encoding of the original piece (curr->isUtf8)
+                Piece* secondHalf = CreatePiece(curr->buffer, curr->start + splitPoint, curr->length - splitPoint, curr->isUtf8);
                 secondHalf->next = curr->next;
 
-                // Create the new text piece
-                Piece* newP = CreatePiece(BUFFER_ADD, add_start_index, len);
+                // Create the new text piece (always UTF-16)
+                Piece* newP = CreatePiece(BUFFER_ADD, add_start_index, len, FALSE);
                 newP->next = secondHalf;
 
                 // Link the first half to the new piece
@@ -393,7 +395,7 @@ BOOL Doc_Insert(SlateDoc* doc, size_t offset, const WCHAR* text, size_t len) {
                 break;
             } else if (offset == cumulative + curr->length) {
                 // Lucky break: Insert exactly between two existing pieces
-                Piece* newP = CreatePiece(BUFFER_ADD, add_start_index, len);
+                Piece* newP = CreatePiece(BUFFER_ADD, add_start_index, len, FALSE);
                 newP->next = curr->next;
                 curr->next = newP;
                 break;
@@ -403,26 +405,28 @@ BOOL Doc_Insert(SlateDoc* doc, size_t offset, const WCHAR* text, size_t len) {
         }
     }
 
-    doc->total_length += len;
-    Doc_UpdateLineMap(doc); // Rebuild the index so 'Enter' works immediately
+    // 5. Update Metadata
+    // RefreshMetadata scans all pieces (UTF-8 and UTF-16) to rebuild the line map
     Doc_RefreshMetadata(doc);
+    
+    // Explicitly update line map if it's a separate UI requirement
+    Doc_UpdateLineMap(doc); 
+
     return TRUE;
 }
 
 BOOL Doc_Delete(SlateDoc* doc, size_t offset, size_t len) {
     if (!doc || len == 0 || offset + len > doc->total_length) return FALSE;
     
+    // 1. Snapshot state before modification
     Doc_PushUndo(doc, offset, TRUE);
 
-    // 1. Split at the START first.
+    // 2. Split at the START and END of the range to delete
+    // Note: SplitPiece must handle the isUtf8 flag during the split (implemented below)
     SplitPiece(doc, offset);
-
-    // 2. Split at the END. 
-    // We must call this AFTER the first split to ensure we find 
-    // the correct boundary for the text we want to keep at the end.
     Piece* after = SplitPiece(doc, offset + len);
 
-    // 3. Perform the deletion
+    // 3. Unlink and free the pieces within the range
     if (offset == 0) {
         Piece* curr = doc->head;
         while (curr && curr != after) {
@@ -452,39 +456,52 @@ BOOL Doc_Delete(SlateDoc* doc, size_t offset, size_t len) {
         }
     }
 
-    // IMPORTANT: Refresh total_length and line_offsets immediately
+    // 4. Critical Metadata Refresh
+    // This recalculates total_length and rebuilds the line_offsets map
     Doc_RefreshMetadata(doc);
+    Doc_UpdateLineMap(doc);
     
     return TRUE;
 }
 
-size_t Doc_GetText(SlateDoc* doc, size_t offset, size_t len, WCHAR* out_buffer) {
-    if (!doc || !out_buffer || len == 0) return 0;
-    size_t cumulative = 0;
-    size_t copied = 0;
+size_t Doc_GetText(SlateDoc* doc, size_t offset, size_t len, WCHAR* dest) {
+    if (offset >= doc->total_length) return 0;
+    if (offset + len > doc->total_length) len = doc->total_length - offset;
+
     Piece* curr = doc->head;
-    while (curr && copied < len) {
+    size_t cumulative = 0;
+    size_t destPos = 0;
+
+    while (curr && destPos < len) {
         if (offset < cumulative + curr->length) {
-            size_t pieceOffset = (offset > cumulative) ? (offset - cumulative) : 0;
-            size_t toCopy = curr->length - pieceOffset;
-            if (copied + toCopy > len) toCopy = len - copied;
-            const WCHAR* src = (curr->buffer == BUFFER_ORIGINAL) ? doc->original_buffer : doc->add_buffer;
-            memcpy(out_buffer + copied, src + curr->start + pieceOffset, toCopy * sizeof(WCHAR));
-            copied += toCopy;
-            offset += toCopy;
+            size_t startInPiece = (offset > cumulative) ? (offset - cumulative) : 0;
+            size_t takeFromPiece = curr->length - startInPiece;
+            if (takeFromPiece > (len - destPos)) takeFromPiece = (len - destPos);
+
+            if (curr->buffer == BUFFER_ORIGINAL && curr->isUtf8) {
+                // FIX: Convert UTF-8 on-the-fly for the view
+                MultiByteToWideChar(CP_UTF8, 0, ((char*)doc->original_buffer) + curr->start + startInPiece, 
+                                   (int)takeFromPiece, dest + destPos, (int)takeFromPiece);
+            } else {
+                const WCHAR* src = (curr->buffer == BUFFER_ORIGINAL) ? (WCHAR*)doc->original_buffer : doc->add_buffer;
+                memcpy(dest + destPos, src + curr->start + startInPiece, takeFromPiece * sizeof(WCHAR));
+            }
+            destPos += takeFromPiece;
         }
         cumulative += curr->length;
         curr = curr->next;
     }
-    return copied;
+    return destPos;
 }
 
 void Doc_StreamToBuffer(SlateDoc* doc, void (*callback)(const WCHAR*, size_t, void*), void* ctx) {
-    Piece* curr = doc->head;
-    while (curr) {
-        const WCHAR* src = (curr->buffer == BUFFER_ORIGINAL) ? doc->original_buffer : doc->add_buffer;
-        callback(src + curr->start, curr->length, ctx);
-        curr = curr->next;
+    WCHAR temp[4096];
+    size_t offset = 0;
+    while (offset < doc->total_length) {
+        size_t chunk = (doc->total_length - offset > 4096) ? 4096 : doc->total_length - offset;
+        Doc_GetText(doc, offset, chunk, temp);
+        callback(temp, chunk, ctx);
+        offset += chunk;
     }
 }
 
@@ -494,6 +511,7 @@ void Doc_StreamToBuffer(SlateDoc* doc, void (*callback)(const WCHAR*, size_t, vo
 SlateDoc* Doc_CreateEmpty() {
     SlateDoc* doc = (SlateDoc*)calloc(1, sizeof(SlateDoc));
     if (!doc) return NULL;
+    doc->original_is_utf8 = TRUE;
     doc->add_capacity = 8192;
     doc->add_buffer = (WCHAR*)malloc(doc->add_capacity * sizeof(WCHAR));
     Doc_UpdateLineMap(doc); // Initializes line_offsets with 0

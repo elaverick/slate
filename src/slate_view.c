@@ -22,6 +22,38 @@ void EnsureCursorVisible(HWND hwnd, ViewState* pState) {
     SetScrollPos(hwnd, SB_VERT, pState->scrollY, TRUE);
 }
 
+
+void UpdateScrollbars(HWND hwnd, ViewState* pState) {
+    if (!pState || !pState->pDoc) return;
+
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    int clientHeight = rc.bottom;
+
+    // USE 64-BIT MATH to calculate true document height
+    long long totalHeight64 = (long long)pState->pDoc->line_count * pState->lineHeight;
+    
+    // Windows Scrollbars are limited to 32-bit (2,147,483,647).
+    // If the document is taller than ~2 billion pixels, we clamp it.
+    // This prevents the negative overflow that blanks the screen.
+    int totalDocHeight;
+    if (totalHeight64 > 2147483647) {
+        totalDocHeight = 2147483647;
+    } else {
+        totalDocHeight = (int)totalHeight64;
+    }
+
+    SCROLLINFO si = {0};
+    si.cbSize = sizeof(si);
+    si.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    si.nMin = 0;
+    si.nMax = totalDocHeight;
+    si.nPage = clientHeight;
+    si.nPos = pState->scrollY;
+
+    SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+}
+
 void View_SetDocument(HWND hwnd, SlateDoc* pDoc) {
     ViewState* pState = GetState(hwnd);
     if (pState) {
@@ -45,6 +77,7 @@ void View_SetDocument(HWND hwnd, SlateDoc* pDoc) {
         RECT rc;
         GetClientRect(hwnd, &rc);
         SendMessage(hwnd, WM_SIZE, 0, MAKELPARAM(rc.right, rc.bottom));
+        UpdateScrollbars(hwnd, pState);
         InvalidateRect(hwnd, NULL, TRUE);
     }
 }
@@ -248,6 +281,7 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
                                        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, 
                                        CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
             SetWindowLongPtr(hwnd, GWLP_USERDATA, (LONG_PTR)pState);
+            UpdateScrollbars(hwnd, pState);
             CreateCaret(hwnd, NULL, 2, pState->lineHeight);
             ShowCaret(hwnd);
             return 0;
@@ -307,6 +341,7 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
                 InvalidateRect(hwnd, NULL, TRUE);
                 UpdateWindow(hwnd); // Ensure immediate visual feedback
             }
+            UpdateScrollbars(hwnd, pState);
             return 0;
         }
 
@@ -317,17 +352,27 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
             int zDelta = GET_WHEEL_DELTA_WPARAM(wParam);
             int linesToScroll = (zDelta / WHEEL_DELTA) * scrollLines;
             
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            int clientHeight = rc.bottom;
+            
+            // 1. Calculate Safe Limits using 64-bit math
+            long long totalHeight64 = (long long)pState->pDoc->line_count * pState->lineHeight;
+            int totalDocHeight = (totalHeight64 > 2147483647) ? 2147483647 : (int)totalHeight64;
+            
+            // 2. Determine Max Scroll Position
+            int maxScroll = totalDocHeight - clientHeight;
+            if (maxScroll < 0) maxScroll = 0;
+
+            // 3. Apply Scroll
             pState->scrollY -= (linesToScroll * pState->lineHeight);
 
-            // Clamp scroll position
-            int maxScroll = (int)pState->pDoc->line_count * pState->lineHeight;
+            // 4. Safe Clamping
             if (pState->scrollY < 0) pState->scrollY = 0;
             if (pState->scrollY > maxScroll) pState->scrollY = maxScroll;
 
-            // Update the scrollbar UI to match
-            SetScrollPos(hwnd, SB_VERT, pState->scrollY, TRUE);
-            
-            InvalidateRect(hwnd, NULL, FALSE);
+            UpdateScrollbars(hwnd, pState);
+            InvalidateRect(hwnd, NULL, TRUE);
             return 0;
         }
 
@@ -359,11 +404,13 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
                 case VK_LEFT:
                     if (pState->cursorOffset > 0) pState->cursorOffset--;
                     if (!isShiftPressed) pState->selectionAnchor = pState->cursorOffset;
+                    NotifyChanged(hwnd);
                     break;
 
                 case VK_RIGHT:
                     if (pState->cursorOffset < pState->pDoc->total_length) pState->cursorOffset++;
                     if (!isShiftPressed) pState->selectionAnchor = pState->cursorOffset;
+                    NotifyChanged(hwnd);
                     break;
 
                 case VK_UP:
@@ -375,6 +422,7 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
                         pState->cursorOffset = prevLineStart + (newCol > 0 ? newCol - 1 : 0);
                     }
                     if (!isShiftPressed) pState->selectionAnchor = pState->cursorOffset;
+                    NotifyChanged(hwnd);
                     break;
 
                 case VK_DOWN:
@@ -386,11 +434,13 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
                         pState->cursorOffset = nextLineStart + (newCol > 0 ? newCol - 1 : 0);
                     }
                     if (!isShiftPressed) pState->selectionAnchor = pState->cursorOffset;
+                    NotifyChanged(hwnd);
                     break;
 
                 case VK_HOME:
                     pState->cursorOffset = Doc_GetLineOffset(pState->pDoc, line - 1);
                     if (!isShiftPressed) pState->selectionAnchor = pState->cursorOffset;
+                    NotifyChanged(hwnd);
                     break;
 
                 case VK_END:
@@ -402,6 +452,7 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
                         if (last == L'\n' || last == L'\r') pState->cursorOffset--;
                     }
                     if (!isShiftPressed) pState->selectionAnchor = pState->cursorOffset;
+                    NotifyChanged(hwnd);
                     break;
 
                 case VK_BACK:
@@ -436,6 +487,7 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
                     NotifyChanged(hwnd);
                     break;
             }
+            UpdateScrollbars(hwnd, pState);
             EnsureCursorVisible(hwnd, pState);
             InvalidateRect(hwnd, NULL, TRUE);
             return 0;
@@ -452,10 +504,9 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
             HBITMAP memBM = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
             HBITMAP oldBM = (HBITMAP)SelectObject(memDC, memBM);
             
-            // Select font into memory DC
             SelectObject(memDC, pState->hFont);
 
-            // 2. Setup Metrics & Logic
+            // 2. Setup Metrics
             TEXTMETRIC tm;
             GetTextMetrics(memDC, &tm);
             int charWidth = tm.tmAveCharWidth;
@@ -464,78 +515,92 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
             size_t selEnd = (pState->cursorOffset < pState->selectionAnchor) ? pState->selectionAnchor : pState->cursorOffset;
             BOOL hasFocus = (GetFocus() == hwnd);
 
-            // 3. Clear the Back Buffer (Handled here instead of WM_ERASEBKGND)
+            // 3. Clear Back Buffer
             HBRUSH hBg = CreateSolidBrush(GetSysColor(COLOR_WINDOW));
             FillRect(memDC, &rc, hBg);
             DeleteObject(hBg);
 
-            if (pState->pDoc) {
+            if (pState->pDoc && pState->pDoc->line_count > 0) {
                 // --- 4. Update Caret Position ---
+                // Use 64-bit intermediate math for large files
                 int line, col;
                 Doc_GetOffsetInfo(pState->pDoc, pState->cursorOffset, &line, &col);
-                int caretX = 5 + (col - 1) * charWidth;
-                int caretY = ((line - 1) * pState->lineHeight) - pState->scrollY;
-                SetCaretPos(caretX, caretY);
-
-                // --- 5. Draw Visible Content ---
-                int first = pState->scrollY / pState->lineHeight;
-                int last = (pState->scrollY + rc.bottom) / pState->lineHeight;
                 
-                for (int i = first; i <= last && i < (int)pState->pDoc->line_count; i++) {
+                // Subtract scrollY (size_t) BEFORE casting to int to stay in GDI range
+                long long relativeCaretY = ((long long)(line - 1) * pState->lineHeight) - (long long)pState->scrollY;
+                int caretX = 5 + (col - 1) * charWidth;
+                
+                // Hide caret if it's off-screen to avoid GDI artifacts
+                if (relativeCaretY >= 0 && relativeCaretY < rc.bottom) {
+                    SetCaretPos(caretX, (int)relativeCaretY);
+                }
+
+                // --- 5. Draw Visible Content (Lazy Paint) ---
+                // Calculate visible range using 64-bit math
+                size_t first = (size_t)(pState->scrollY / pState->lineHeight);
+                size_t last = (size_t)((pState->scrollY + rc.bottom) / pState->lineHeight);
+                
+                for (size_t i = first; i <= last && i < pState->pDoc->line_count; i++) {
                     size_t lineStart = Doc_GetLineOffset(pState->pDoc, i);
-                    size_t lineEnd = Doc_GetLineOffset(pState->pDoc, i + 1);
+                    size_t lineEnd = (i + 1 < pState->pDoc->line_count) ? 
+                                    Doc_GetLineOffset(pState->pDoc, i + 1) : pState->pDoc->total_length;
+                    
                     size_t len = lineEnd - lineStart;
+                    if (len == 0) continue;
 
-                    if (len > 0) {
-                        WCHAR* buf = malloc((len + 1) * sizeof(WCHAR));
-                        Doc_GetText(pState->pDoc, lineStart, len, buf);
-                        
-                        size_t dLen = len;
-                        while (dLen > 0 && (buf[dLen-1] == L'\n' || buf[dLen-1] == L'\r')) dLen--;
+                    WCHAR* buf = malloc((len + 1) * sizeof(WCHAR));
+                    if (!buf) continue;
 
-                        int lineY = (i * pState->lineHeight) - pState->scrollY;
+                    Doc_GetText(pState->pDoc, lineStart, len, buf);
+                    
+                    // Clean up newlines for display
+                    size_t dLen = len;
+                    while (dLen > 0 && (buf[dLen-1] == L'\n' || buf[dLen-1] == L'\r')) dLen--;
 
-                        // A. Draw Normal Text
-                        SetTextColor(memDC, GetSysColor(COLOR_WINDOWTEXT));
-                        SetBkMode(memDC, OPAQUE);
-                        SetBkColor(memDC, GetSysColor(COLOR_WINDOW));
-                        TextOutW(memDC, 5, lineY, buf, (int)dLen);
+                    // CRITICAL: Calculate Y relative to the top of the CLIENT area
+                    // This ensures lineY is always a small, safe integer
+                    int lineY = (int)(((long long)i * pState->lineHeight) - (long long)pState->scrollY);
 
-                        // B. Draw Selection Overlay
-                        if (selStart != selEnd && selStart < lineEnd && selEnd > lineStart) {
-                            size_t intersectStart = (selStart > lineStart) ? selStart : lineStart;
-                            size_t intersectEnd = (selEnd < lineEnd) ? selEnd : lineEnd;
+                    // A. Draw Normal Text
+                    SetTextColor(memDC, GetSysColor(COLOR_WINDOWTEXT));
+                    SetBkMode(memDC, OPAQUE);
+                    SetBkColor(memDC, GetSysColor(COLOR_WINDOW));
+                    TextOutW(memDC, 5, lineY, buf, (int)dLen);
 
-                            if (intersectStart < intersectEnd) {
-                                int x1 = 5 + (int)(intersectStart - lineStart) * charWidth;
-                                int x2 = 5 + (int)(intersectEnd - lineStart) * charWidth;
-                                RECT selRect = { x1, lineY, x2, lineY + pState->lineHeight };
+                    // B. Draw Selection Overlay
+                    if (selStart != selEnd && selStart < lineEnd && selEnd > lineStart) {
+                        size_t intersectStart = (selStart > lineStart) ? selStart : lineStart;
+                        size_t intersectEnd = (selEnd < lineEnd) ? selEnd : lineEnd;
 
-                                COLORREF bgColor = hasFocus ? GetSysColor(COLOR_HIGHLIGHT) : GetSysColor(COLOR_3DFACE);
-                                COLORREF textColor = hasFocus ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_BTNTEXT);
+                        if (intersectStart < intersectEnd) {
+                            int x1 = 5 + (int)(intersectStart - lineStart) * charWidth;
+                            int x2 = 5 + (int)(intersectEnd - lineStart) * charWidth;
+                            RECT selRect = { x1, lineY, x2, lineY + pState->lineHeight };
 
-                                HBRUSH hSelBrush = CreateSolidBrush(bgColor);
-                                FillRect(memDC, &selRect, hSelBrush);
-                                DeleteObject(hSelBrush);
+                            COLORREF bgColor = hasFocus ? GetSysColor(COLOR_HIGHLIGHT) : GetSysColor(COLOR_3DFACE);
+                            COLORREF textColor = hasFocus ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_BTNTEXT);
 
-                                SetTextColor(memDC, textColor);
-                                SetBkMode(memDC, TRANSPARENT);
-                                
-                                WCHAR* selTextPtr = buf + (intersectStart - lineStart);
-                                int selTextLen = (int)(intersectEnd - intersectStart);
-                                while (selTextLen > 0 && (selTextPtr[selTextLen-1] == L'\n' || selTextPtr[selTextLen-1] == L'\r')) selTextLen--;
-                                
-                                if (selTextLen > 0) {
-                                    TextOutW(memDC, x1, lineY, selTextPtr, selTextLen);
-                                }
+                            HBRUSH hSelBrush = CreateSolidBrush(bgColor);
+                            FillRect(memDC, &selRect, hSelBrush);
+                            DeleteObject(hSelBrush);
+
+                            SetTextColor(memDC, textColor);
+                            SetBkMode(memDC, TRANSPARENT);
+                            
+                            WCHAR* selTextPtr = buf + (intersectStart - lineStart);
+                            int selTextLen = (int)(intersectEnd - intersectStart);
+                            while (selTextLen > 0 && (selTextPtr[selTextLen-1] == L'\n' || selTextPtr[selTextLen-1] == L'\r')) selTextLen--;
+                            
+                            if (selTextLen > 0) {
+                                TextOutW(memDC, x1, lineY, selTextPtr, selTextLen);
                             }
                         }
-                        free(buf);
                     }
+                    free(buf);
                 }
             }
 
-            // 6. THE FLIP: Copy the finished memory buffer to the screen at once
+            // 6. Flip
             BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
 
             // 7. Cleanup
@@ -569,19 +634,40 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
         case WM_VSCROLL: {
             SCROLLINFO si = { sizeof(si), SIF_ALL };
             GetScrollInfo(hwnd, SB_VERT, &si);
+            
             int oldY = pState->scrollY;
+            int newY = oldY;
+
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            int clientHeight = rc.bottom;
+            
+            // 1. Safe Limit Calculation
+            long long totalHeight64 = (long long)pState->pDoc->line_count * pState->lineHeight;
+            int totalDocHeight = (totalHeight64 > 2147483647) ? 2147483647 : (int)totalHeight64;
+
+            int maxScroll = totalDocHeight - clientHeight;
+            if (maxScroll < 0) maxScroll = 0;
+
             switch (LOWORD(wParam)) {
-                case SB_LINEUP: si.nPos -= pState->lineHeight; break;
-                case SB_LINEDOWN: si.nPos += pState->lineHeight; break;
-                case SB_THUMBTRACK: si.nPos = si.nTrackPos; break;
-                // ... handle other scroll cases ...
+                case SB_TOP:        newY = 0; break;
+                case SB_BOTTOM:     newY = maxScroll; break;
+                case SB_LINEUP:     newY -= pState->lineHeight; break;
+                case SB_LINEDOWN:   newY += pState->lineHeight; break;
+                case SB_PAGEUP:     newY -= clientHeight; break;
+                case SB_PAGEDOWN:   newY += clientHeight; break;
+                case SB_THUMBTRACK: newY = si.nTrackPos; break;
+                default: break;
             }
-            si.fMask = SIF_POS;
-            SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
-            GetScrollInfo(hwnd, SB_VERT, &si);
-            pState->scrollY = si.nPos;
-            if (oldY != pState->scrollY) {
-                ScrollWindowEx(hwnd, 0, oldY - pState->scrollY, NULL, NULL, NULL, NULL, SW_INVALIDATE);
+
+            // 2. Safe Clamping
+            if (newY < 0) newY = 0;
+            if (newY > maxScroll) newY = maxScroll;
+
+            if (newY != oldY) {
+                pState->scrollY = newY;
+                UpdateScrollbars(hwnd, pState);
+                InvalidateRect(hwnd, NULL, TRUE);
             }
             return 0;
         }
@@ -592,6 +678,7 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
                 si.nMax = (int)pState->pDoc->line_count * pState->lineHeight;
                 si.nPage = HIWORD(lParam);
                 SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+                UpdateScrollbars(hwnd, pState);
             }
             return 0;
         }
@@ -628,6 +715,9 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
             // 4. Start the drag operation
             pState->isDragging = TRUE;
             SetCapture(hwnd); // Directs all mouse input to this window even if mouse leaves client area
+
+            // IMPORTANT: Notify the main window to update the status bar
+            NotifyChanged(hwnd);
             
             // 5. Visual update
             InvalidateRect(hwnd, NULL, TRUE);
