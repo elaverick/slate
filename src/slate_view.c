@@ -14,6 +14,7 @@ void View_SetDefaultColors(HWND hwnd) {
     pState->colorBg   = RGB(0xE6, 0xE3, 0xDA); 
     pState->colorText = RGB(0x22, 0x22, 0x22); 
     pState->colorDim  = RGB(150, 150, 150);    
+    InvalidateRect(hwnd, NULL, TRUE);
 }
 
 void View_UseSystemColors(HWND hwnd) {
@@ -24,6 +25,7 @@ void View_UseSystemColors(HWND hwnd) {
     pState->colorBg   = GetSysColor(COLOR_WINDOW);
     pState->colorText = GetSysColor(COLOR_WINDOWTEXT);
     pState->colorDim  = RGB(180, 180, 180);
+    InvalidateRect(hwnd, NULL, TRUE);
 }
 
 BOOL View_IsUsingSystemColors(HWND hwnd) {
@@ -47,6 +49,137 @@ void EnsureCursorVisible(HWND hwnd, ViewState* pState) {
     SetScrollPos(hwnd, SB_VERT, pState->scrollY, TRUE);
 }
 
+static void GetCursorVisualPos(HWND hwnd, ViewState* pState, size_t targetOffset, int* outX, int* outY) {
+    HDC hdc = GetDC(hwnd);
+    SelectObject(hdc, pState->hFont);
+    RECT clientRect;
+    GetClientRect(hwnd, &clientRect);
+    int wrapWidth = clientRect.right - 10;
+
+    int currentY = 0;
+    size_t startLineIdx = (pState->bWordWrap) ? (size_t)pState->scrollY : 0;
+    int finalX = 5, finalY = 0;
+    BOOL found = FALSE;
+
+    for (size_t i = startLineIdx; i < pState->pDoc->line_count; i++) {
+        size_t lineStart = Doc_GetLineOffset(pState->pDoc, i);
+        size_t lineEnd = (i + 1 < pState->pDoc->line_count) ? 
+                         Doc_GetLineOffset(pState->pDoc, i + 1) : pState->pDoc->total_length;
+        
+        size_t len = lineEnd - lineStart;
+        WCHAR* buf = malloc((len + 1) * sizeof(WCHAR));
+        Doc_GetText(pState->pDoc, lineStart, len, buf);
+        size_t dLen = len;
+        while (dLen > 0 && (buf[dLen-1] == L'\n' || buf[dLen-1] == L'\r')) dLen--;
+
+        if (targetOffset >= lineStart && targetOffset <= lineStart + dLen) {
+            size_t rel = targetOffset - lineStart;
+            
+            // Get height of the text block up to the cursor index
+            RECT rcM = { 0, 0, wrapWidth, 0 };
+            DrawTextW(hdc, buf, (int)rel, &rcM, DT_WORDBREAK | DT_EXPANDTABS | DT_CALCRECT | DT_NOPREFIX);
+            int blockH = (rcM.bottom <= 0) ? pState->lineHeight : rcM.bottom;
+            
+            // Calculate which visual row we are on
+            finalY = currentY + blockH - pState->lineHeight;
+
+            // Backtrack to find the start of the current visual line
+            size_t vLineStart = 0;
+            for (size_t k = rel; k > 0; k--) {
+                RECT rcCheck = { 0, 0, wrapWidth, 0 };
+                DrawTextW(hdc, buf, (int)k - 1, &rcCheck, DT_WORDBREAK | DT_EXPANDTABS | DT_CALCRECT | DT_NOPREFIX);
+                if (rcCheck.bottom < rcM.bottom) {
+                    vLineStart = k;
+                    break;
+                }
+            }
+            
+            // Measure X relative to the start of this specific visual row
+            // We use DrawText for measurement to handle tabs identically to PAINT
+            RECT rcX = { 0, 0, wrapWidth, 0 };
+            DrawTextW(hdc, buf + vLineStart, (int)(rel - vLineStart), &rcX, DT_EXPANDTABS | DT_CALCRECT | DT_NOPREFIX);
+            finalX = 5 + rcX.right;
+            found = TRUE;
+        }
+
+        RECT rcFull = { 0, 0, wrapWidth, 0 };
+        DrawTextW(hdc, buf, (int)dLen, &rcFull, DT_WORDBREAK | DT_EXPANDTABS | DT_CALCRECT | DT_NOPREFIX);
+        currentY += (rcFull.bottom <= 0) ? pState->lineHeight : rcFull.bottom;
+        
+        free(buf);
+        if (found) break;
+    }
+
+    ReleaseDC(hwnd, hdc);
+    *outX = finalX; *outY = finalY;
+}
+
+// Maps X,Y back to a document offset
+size_t View_XYToOffset(HWND hwnd, int targetX, int targetY) {
+    ViewState* pState = (ViewState*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    HDC hdc = GetDC(hwnd);
+    SelectObject(hdc, pState->hFont);
+    RECT clientRc;
+    GetClientRect(hwnd, &clientRc);
+    int wrapWidth = clientRc.right - 10;
+
+    int currentY = -pState->scrollY;
+    size_t resultOffset = 0;
+
+    for (size_t i = 0; i < pState->pDoc->line_count; i++) {
+        size_t lineStart = Doc_GetLineOffset(pState->pDoc, i);
+        size_t lineEnd = (i + 1 < pState->pDoc->line_count) ? 
+                         Doc_GetLineOffset(pState->pDoc, i + 1) : pState->pDoc->total_length;
+        
+        size_t len = lineEnd - lineStart;
+        WCHAR* buf = malloc((len + 1) * sizeof(WCHAR));
+        Doc_GetText(pState->pDoc, lineStart, len, buf);
+        size_t dLen = len;
+        while (dLen > 0 && (buf[dLen-1] == L'\n' || buf[dLen-1] == L'\r')) dLen--;
+
+        RECT rcFull = { 0, 0, wrapWidth, 0 };
+        DrawTextW(hdc, buf, (int)dLen, &rcFull, DT_WORDBREAK | DT_EXPANDTABS | DT_CALCRECT | DT_NOPREFIX);
+        int totalH = (rcFull.bottom <= 0) ? pState->lineHeight : rcFull.bottom;
+
+        if (targetY >= currentY && targetY < currentY + totalH) {
+            int visualY = targetY - currentY;
+            int bestOffset = 0;
+            int minDistance = 999999;
+
+            for (size_t k = 0; k <= dLen; k++) {
+                RECT rcM = { 0, 0, wrapWidth, 0 };
+                DrawTextW(hdc, buf, (int)k, &rcM, DT_WORDBREAK | DT_EXPANDTABS | DT_CALCRECT | DT_NOPREFIX);
+                int cy = (rcM.bottom <= 0) ? 0 : rcM.bottom - pState->lineHeight;
+
+                size_t vStart = 0;
+                for (size_t j = k; j > 0; j--) {
+                    RECT rcC = { 0, 0, wrapWidth, 0 };
+                    DrawTextW(hdc, buf, (int)j - 1, &rcC, DT_WORDBREAK | DT_EXPANDTABS | DT_CALCRECT | DT_NOPREFIX);
+                    if (rcC.bottom < rcM.bottom) { vStart = j; break; }
+                }
+                
+                // FIX: GetTabbedTextExtentW returns DWORD, takes 5 arguments
+                DWORD extent = GetTabbedTextExtentW(hdc, buf + vStart, (int)(k - vStart), 0, NULL);
+                int cx = 5 + LOWORD(extent);
+
+                int dist = abs(cy - visualY) * 100 + abs(cx - targetX);
+                if (dist < minDistance) {
+                    minDistance = dist;
+                    bestOffset = (int)k;
+                }
+            }
+            resultOffset = lineStart + bestOffset;
+            free(buf);
+            break;
+        }
+        currentY += totalH;
+        free(buf);
+        resultOffset = lineStart + dLen; 
+    }
+
+    ReleaseDC(hwnd, hdc);
+    return resultOffset;
+}
 
 void UpdateScrollbars(HWND hwnd, ViewState* pState) {
     if (!pState || !pState->pDoc) return;
@@ -123,6 +256,10 @@ size_t View_GetCursorOffset(HWND hwnd) {
 
 // Helper to convert mouse coordinates to logical offset
 size_t GetOffsetFromPoint(HWND hwnd, ViewState* pState, int x, int y) {
+    if (pState->bWordWrap) {
+        return View_XYToOffset(hwnd, x, y);
+    }
+
     HDC hdc = GetDC(hwnd);
     SelectObject(hdc, pState->hFont);
     
@@ -321,8 +458,59 @@ void View_SetWordWrap(HWND hwnd, BOOL bWrap) {
     }
 }
 
+void UpdateCaretPosition(HWND hwnd, ViewState* pState) {
+    if (!pState || !pState->pDoc || GetFocus() != hwnd) return;
+
+    int x, y;
+    if (pState->bWordWrap) {
+        GetCursorVisualPos(hwnd, pState, pState->cursorOffset, &x, &y);
+    } else {
+        int cursorLine, cursorCol;
+        Doc_GetOffsetInfo(pState->pDoc, pState->cursorOffset, &cursorLine, &cursorCol);
+
+        HDC hdc = GetDC(hwnd);
+        SelectObject(hdc, pState->hFont);
+        
+        TEXTMETRIC tm;
+        GetTextMetrics(hdc, &tm);
+        int tabStops = tm.tmAveCharWidth * 4; // MATCH WM_PAINT EXACTLY
+
+        if (pState->bCommandMode) {
+            // The prompt always appears at the line where the cursor WAS
+            y = ((cursorLine - 1) * pState->lineHeight) - pState->scrollY;
+            
+            // Measure ":text" to place the caret correctly in the prompt
+            WCHAR temp[260];
+            int len = swprintf(temp, 260, L":%.*s", (int)pState->commandCaretPos, pState->szCommandBuf);
+            SIZE sz;
+            GetTextExtentPoint32W(hdc, temp, len, &sz);
+            x += sz.cx;
+        } else {
+            int visualLine = cursorLine - 1;
+            // If cursor is at or below the line where the command prompt is injected:
+            if (pState->bCommandMode) visualLine++; 
+
+            y = (visualLine * pState->lineHeight) - pState->scrollY;
+
+            size_t lineStart = Doc_GetLineOffset(pState->pDoc, cursorLine - 1);
+            size_t len = pState->cursorOffset - lineStart;
+            WCHAR* lineBuf = (WCHAR*)malloc((len + 1) * sizeof(WCHAR));
+            if (lineBuf) {
+                Doc_GetText(pState->pDoc, lineStart, len, lineBuf);
+                lineBuf[len] = L'\0';
+                x += LOWORD(GetTabbedTextExtentW(hdc, lineBuf, (int)len, 1, &tabStops));
+                free(lineBuf);
+            }
+        }
+        ReleaseDC(hwnd, hdc);
+    }
+    
+    SetCaretPos(x, y);
+}
+
 LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
     ViewState* pState = GetState(hwnd);
+    //if (!pState) return 0;
 
     switch (uMsg) {
         case WM_CREATE: {
@@ -343,52 +531,95 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
             // Return non-zero to tell Windows we handled it and avoid the pre-paint flash
             return 1;
 
-        case WM_CHAR: {
+        case WM_CHAR: {         
             WCHAR c = (WCHAR)wParam;
-            
-            // Skip control characters that are processed in WM_KEYDOWN
-            if (c == 8 || c == 127) return 0;
-            
-            if (c == L'\r' || c == L'\n' || (c >= 32) || c == L'\t') {
-                if (c == L'\r') c = L'\n'; // Normalize to LF
 
-                // Replace any highlighted selection with the typed character
-                if (pState->cursorOffset != pState->selectionAnchor) {
-                    size_t start = (pState->cursorOffset < pState->selectionAnchor) ? pState->cursorOffset : pState->selectionAnchor;
-                    size_t len = (pState->cursorOffset > pState->selectionAnchor) ? 
-                                (pState->cursorOffset - pState->selectionAnchor) : (pState->selectionAnchor - pState->cursorOffset);
+            // --- 1. COMMAND MODE INTERCEPTOR ---
+            if (pState->bCommandMode) {
+                
+                // Block Enter, Escape, and Tab from reaching the document logic
+                if (c == L'\r' || c == L'\n' || c == 27) {
+                    pState->bCommandMode = FALSE;
+                    pState->commandLen = 0;
+                    pState->commandCaretPos = 0;
+                    InvalidateRect(hwnd, NULL, TRUE);
+                    UpdateCaretPosition(hwnd, pState);
+                    return 0; // Character is eaten, document is safe
+                }
+                
+                // Skip control characters (Back, Enter, Esc) handled in WM_KEYDOWN
+                // We only want to capture printable text (ASCII 32 and above)
+                if (c < 32 || c == 127) return 0;
+
+                // Append to the command buffer if there is space (leaving room for null terminator)
+                if (pState->commandLen < 255) {
+                    // If the caret is not at the end, shift text to the right to make room (Insert mode behavior)
+                    if (pState->commandCaretPos < pState->commandLen) {
+                        memmove(&pState->szCommandBuf[pState->commandCaretPos + 1], 
+                                &pState->szCommandBuf[pState->commandCaretPos], 
+                                (pState->commandLen - pState->commandCaretPos) * sizeof(WCHAR));
+                    }
                     
-                    Doc_Delete(pState->pDoc, start, len);
-                    pState->cursorOffset = pState->selectionAnchor = start;
-                } else if (!pState->bInsertMode && c != L'\n') {
-                    // Overtype the next character when not in insert mode
-                    if (pState->cursorOffset < pState->pDoc->total_length) {
-                        WCHAR nextChar;
-                        Doc_GetText(pState->pDoc, pState->cursorOffset, 1, &nextChar);
-                        // Don't overtype the newline; it breaks the line map logic
-                        if (nextChar != L'\n') {
-                            Doc_Delete(pState->pDoc, pState->cursorOffset, 1);
+                    pState->szCommandBuf[pState->commandCaretPos] = c;
+                    pState->commandLen++;
+                    pState->commandCaretPos++;
+                    pState->szCommandBuf[pState->commandLen] = L'\0';
+                    
+                    InvalidateRect(hwnd, NULL, TRUE);
+                    UpdateCaretPosition(hwnd, pState);
+                }
+                return 0;
+            } else {
+                // --- 2. STANDARD EDITOR LOGIC ---
+                
+                // Skip control characters that are processed in WM_KEYDOWN (Backspace/Delete)
+                if (c == 8 || c == 127) return 0;
+                
+                // Process printable characters, tabs, and newlines
+                if (c == L'\r' || c == L'\n' || (c >= 32) || c == L'\t') {
+                    if (c == L'\r') c = L'\n'; // Normalize to LF
+
+                    // Replace any highlighted selection with the typed character
+                    if (pState->cursorOffset != pState->selectionAnchor) {
+                        size_t start = (pState->cursorOffset < pState->selectionAnchor) ? pState->cursorOffset : pState->selectionAnchor;
+                        size_t len = (pState->cursorOffset > pState->selectionAnchor) ? 
+                                    (pState->cursorOffset - pState->selectionAnchor) : (pState->selectionAnchor - pState->cursorOffset);
+                        
+                        Doc_Delete(pState->pDoc, start, len);
+                        pState->cursorOffset = pState->selectionAnchor = start;
+                    } 
+                    else if (!pState->bInsertMode && c != L'\n') {
+                        // Overtype logic: Remove the next character if we aren't at EOF
+                        if (pState->cursorOffset < pState->pDoc->total_length) {
+                            WCHAR nextChar;
+                            Doc_GetText(pState->pDoc, pState->cursorOffset, 1, &nextChar);
+                            // Don't overtype the newline; it preserves the document's line structure
+                            if (nextChar != L'\n') {
+                                Doc_Delete(pState->pDoc, pState->cursorOffset, 1);
+                            }
                         }
                     }
+
+                    // Insert the character and collapse the selection/anchor
+                    Doc_Insert(pState->pDoc, pState->cursorOffset, &c, 1);
+                    pState->cursorOffset++;
+                    pState->selectionAnchor = pState->cursorOffset;
+
+                    // Maintain visibility if the user typed a newline
+                    if (c == L'\n') {
+                        EnsureCursorVisible(hwnd, pState);
+                    }
+
+                    // Notify parent so the status bar and "Modified" flag update
+                    NotifyParent(hwnd, EN_CHANGE);
+
+                    UpdateCaretPosition(hwnd, pState);
+                    InvalidateRect(hwnd, NULL, TRUE);
+                    UpdateWindow(hwnd); // Ensure immediate visual feedback
                 }
-
-                // Insert the character and collapse the selection
-                Doc_Insert(pState->pDoc, pState->cursorOffset, &c, 1);
-                pState->cursorOffset++;
-                pState->selectionAnchor = pState->cursorOffset;
-
-                // Keep the caret visible after newline insertion
-                if (c == L'\n') {
-                    EnsureCursorVisible(hwnd, pState);
-                }
-
-                // Notify the parent for title/status updates
-                NotifyParent(hwnd, EN_CHANGE);
-
-                InvalidateRect(hwnd, NULL, TRUE);
-                UpdateWindow(hwnd); // Ensure immediate visual feedback
+                
+                UpdateScrollbars(hwnd, pState);
             }
-            UpdateScrollbars(hwnd, pState);
             return 0;
         }
 
@@ -429,7 +660,74 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
             BOOL isShiftPressed = (GetKeyState(VK_SHIFT) & 0x8000);
             BOOL isCtrlPressed = (GetKeyState(VK_CONTROL) & 0x8000);
 
+            // --- 1. COMMAND MODE INTERCEPTOR ---
+            if (pState->bCommandMode) {
+                switch (wParam) {
+                    case VK_LEFT:
+                        if (pState->commandCaretPos > 0) pState->commandCaretPos--;
+                        break;
+                    case VK_RIGHT:
+                        if (pState->commandCaretPos < pState->commandLen) pState->commandCaretPos++;
+                        break;
+                    case VK_HOME:
+                        pState->commandCaretPos = 0;
+                        break;
+                    case VK_END:
+                        pState->commandCaretPos = pState->commandLen;
+                        break;
+                    case VK_BACK:
+                        if (pState->commandCaretPos > 0) {
+                            // Shift buffer left to overwrite the character before the caret
+                            memmove(&pState->szCommandBuf[pState->commandCaretPos - 1], 
+                                    &pState->szCommandBuf[pState->commandCaretPos], 
+                                    (pState->commandLen - pState->commandCaretPos + 1) * sizeof(WCHAR));
+                            pState->commandLen--;
+                            pState->commandCaretPos--;
+                        }
+                        break;
+                    case VK_DELETE:
+                        if (pState->commandCaretPos < pState->commandLen) {
+                            // Shift buffer left to overwrite the character at the caret
+                            memmove(&pState->szCommandBuf[pState->commandCaretPos], 
+                                    &pState->szCommandBuf[pState->commandCaretPos + 1], 
+                                    (pState->commandLen - pState->commandCaretPos) * sizeof(WCHAR));
+                            pState->commandLen--;
+                        }
+                        break;
+                    case VK_RETURN:
+                    case VK_ESCAPE:
+                        // DO NOT set bCommandMode = FALSE here. 
+                        // Let WM_CHAR handle the state transition to "eat" the character.
+                    break;
+                    default:
+                        // CRITICAL: Allow other keys (like Space) to pass through to TranslateMessage
+                        // so they generate a WM_CHAR message.
+                        return DefWindowProc(hwnd, uMsg, wParam, lParam);
+                }
+                InvalidateRect(hwnd, NULL, TRUE);
+                UpdateCaretPosition(hwnd, pState);
+                return 0; // Block all other keys from reaching the editor
+            }
+
+            // --- 2. STANDARD EDITOR KEYS ---
             switch (wParam) {
+                // Caps Lock Handler: Update status bar immediately
+                case VK_CAPITAL:
+                    NotifyParent(hwnd, EN_SELCHANGE);
+                    break;
+
+                // Trigger Colon Prompt: CTRL + ;
+                case VK_OEM_1: // ';' key
+                    if (isCtrlPressed) {
+                        pState->bCommandMode = TRUE;
+                        pState->commandLen = 0;      // RESET LENGTH
+                        pState->commandCaretPos = 0; // RESET CARET
+                        pState->szCommandBuf[0] = L'\0';
+                        InvalidateRect(hwnd, NULL, TRUE);
+                        return 0;
+                    }
+                    break;
+
                 case 'Z':
                     if (isCtrlPressed) { View_Undo(hwnd); return 0; }
                     break;
@@ -448,6 +746,7 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
                 case 'A':
                     if (isCtrlPressed) { View_SelectAll(hwnd); return 0; }
                     break;
+
                 case VK_LEFT:
                     if (pState->cursorOffset > 0) pState->cursorOffset--;
                     if (!isShiftPressed) pState->selectionAnchor = pState->cursorOffset;
@@ -461,27 +760,39 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
                     break;
 
                 case VK_UP:
-                    if (line > 1) {
-                        size_t prevLineStart = Doc_GetLineOffset(pState->pDoc, line - 2);
-                        size_t prevLineEnd = Doc_GetLineOffset(pState->pDoc, line - 1);
-                        size_t prevLen = prevLineEnd - prevLineStart;
-                        size_t newCol = (col > (int)prevLen) ? prevLen : (size_t)col;
-                        pState->cursorOffset = prevLineStart + (newCol > 0 ? newCol - 1 : 0);
+                    if (pState->bWordWrap) {
+                        int x, y;
+                        GetCursorVisualPos(hwnd, pState, pState->cursorOffset, &x, &y);
+                        pState->cursorOffset = View_XYToOffset(hwnd, x, y - pState->lineHeight);
+                    } else {
+                        if (line > 1) {
+                            size_t prevLineStart = Doc_GetLineOffset(pState->pDoc, line - 2);
+                            size_t prevLineEnd = Doc_GetLineOffset(pState->pDoc, line - 1);
+                            size_t prevLen = prevLineEnd - prevLineStart;
+                            size_t newCol = (col > (int)prevLen) ? prevLen : (size_t)col;
+                            pState->cursorOffset = prevLineStart + (newCol > 0 ? newCol - 1 : 0);
+                        }
                     }
                     if (!isShiftPressed) pState->selectionAnchor = pState->cursorOffset;
                     NotifyParent(hwnd, EN_SELCHANGE);
                     break;
 
                 case VK_DOWN:
-                    if (line < (int)pState->pDoc->line_count) {
-                        size_t nextLineStart = Doc_GetLineOffset(pState->pDoc, line);
-                        size_t nextLineEnd = Doc_GetLineOffset(pState->pDoc, line + 1);
-                        size_t nextLen = nextLineEnd - nextLineStart;
-                        size_t newCol = (col > (int)nextLen) ? nextLen : (size_t)col;
-                        pState->cursorOffset = nextLineStart + (newCol > 0 ? newCol - 1 : 0);
+                    if (pState->bWordWrap) {
+                        int x, y;
+                        GetCursorVisualPos(hwnd, pState, pState->cursorOffset, &x, &y);
+                        pState->cursorOffset = View_XYToOffset(hwnd, x, y + pState->lineHeight);
+                    } else{
+                        if (line < (int)pState->pDoc->line_count) {
+                            size_t nextLineStart = Doc_GetLineOffset(pState->pDoc, line);
+                            size_t nextLineEnd = Doc_GetLineOffset(pState->pDoc, line + 1);
+                            size_t nextLen = nextLineEnd - nextLineStart;
+                            size_t newCol = (col > (int)nextLen) ? nextLen : (size_t)col;
+                            pState->cursorOffset = nextLineStart + (newCol > 0 ? newCol - 1 : 0);
+                        }
+                        if (!isShiftPressed) pState->selectionAnchor = pState->cursorOffset;
+                        NotifyParent(hwnd, EN_SELCHANGE);
                     }
-                    if (!isShiftPressed) pState->selectionAnchor = pState->cursorOffset;
-                    NotifyParent(hwnd, EN_SELCHANGE);
                     break;
 
                 case VK_HOME:
@@ -492,7 +803,6 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
 
                 case VK_END:
                     pState->cursorOffset = Doc_GetLineOffset(pState->pDoc, line);
-                    // Don't land past the newline
                     if (pState->cursorOffset > 0) {
                         WCHAR last;
                         Doc_GetText(pState->pDoc, pState->cursorOffset - 1, 1, &last);
@@ -505,7 +815,6 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
                 case VK_BACK:
                 case VK_DELETE:
                     if (pState->cursorOffset != pState->selectionAnchor) {
-                        // Delete selection
                         size_t start = (pState->cursorOffset < pState->selectionAnchor) ? pState->cursorOffset : pState->selectionAnchor;
                         size_t len = (pState->cursorOffset > pState->selectionAnchor) ? 
                                     (pState->cursorOffset - pState->selectionAnchor) : (pState->selectionAnchor - pState->cursorOffset);
@@ -513,7 +822,6 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
                         pState->cursorOffset = pState->selectionAnchor = start;
                         NotifyParent(hwnd, EN_CHANGE);
                     } else {
-                        // Standard single char delete
                         if (wParam == VK_BACK && pState->cursorOffset > 0) {
                             Doc_Delete(pState->pDoc, --pState->cursorOffset, 1);
                             pState->selectionAnchor = pState->cursorOffset;
@@ -528,8 +836,6 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
                 case VK_INSERT:
                     if (isCtrlPressed) { View_Copy(hwnd); return 0; }
                     if (isShiftPressed) { View_Paste(hwnd); return 0; }
-
-                    // If no modifiers, just toggle insert/overwrite mode
                     pState->bInsertMode = !pState->bInsertMode;
                     NotifyParent(hwnd, EN_SELCHANGE);
                     break;
@@ -539,7 +845,6 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
             InvalidateRect(hwnd, NULL, TRUE);
             return 0;
         }
-
         case WM_PAINT: {
             PAINTSTRUCT ps;
             HDC hdc = BeginPaint(hwnd, &ps);
@@ -551,7 +856,7 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
             HBITMAP memBM = CreateCompatibleBitmap(hdc, rc.right, rc.bottom);
             HBITMAP oldBM = (HBITMAP)SelectObject(memDC, memBM);
 
-            // Use the colors from state instead of system defaults
+            // Use the colors from state
             COLORREF currentBg   = pState->colorBg;
             COLORREF currentText = pState->colorText;
             COLORREF currentDim  = pState->colorDim;
@@ -562,7 +867,7 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
             TEXTMETRIC tm;
             GetTextMetrics(memDC, &tm);
             int charWidth = tm.tmAveCharWidth;
-            int tabStops = charWidth * 4; // Standard 4-character tab width
+            int tabStops = charWidth * 4; 
 
             size_t selStart = (pState->cursorOffset < pState->selectionAnchor) ? pState->cursorOffset : pState->selectionAnchor;
             size_t selEnd = (pState->cursorOffset < pState->selectionAnchor) ? pState->selectionAnchor : pState->cursorOffset;
@@ -570,6 +875,7 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
 
             // Clear the back buffer
             HBRUSH hBg = CreateSolidBrush(currentBg);
+            SetBkMode(memDC, TRANSPARENT); 
             FillRect(memDC, &rc, hBg);
             DeleteObject(hBg);
 
@@ -584,10 +890,36 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
                     textRect.left += 5; 
                     textRect.right -= 5;
 
+                    // Get cursor info once to decide where to inject the prompt
+                    int cursorLine, cursorCol;
+                    Doc_GetOffsetInfo(pState->pDoc, pState->cursorOffset, &cursorLine, &cursorCol);
+
+                    // Ensure we start with transparent background for the whole loop
+                    SetBkMode(memDC, TRANSPARENT);
+
                     for (size_t i = startLine; i < pState->pDoc->line_count; i++) {
+                        
+                        // --- COMMAND PROMPT INJECTION ---
+                        if (pState->bCommandMode && (int)i == (cursorLine - 1)) {
+                            RECT rcPrompt = textRect;
+                            rcPrompt.top = currentY;
+                            rcPrompt.bottom = currentY + pState->lineHeight;
+
+                            // Optional: Slight background fill for the prompt area to distinguish it
+                            // FillRect(memDC, &rcPrompt, hBgBrush); 
+
+                            WCHAR pBuf[300];
+                            int pLen = swprintf(pBuf, 300, L":%s", pState->szCommandBuf);
+                            
+                            // Draw the prompt text
+                            DrawTextW(memDC, pBuf, pLen, &rcPrompt, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
+                            
+                            currentY += pState->lineHeight;
+                        }
+
                         size_t lineStart = Doc_GetLineOffset(pState->pDoc, i);
                         size_t lineEnd = (i + 1 < pState->pDoc->line_count) ? 
-                                         Doc_GetLineOffset(pState->pDoc, i + 1) : pState->pDoc->total_length;
+                                        Doc_GetLineOffset(pState->pDoc, i + 1) : pState->pDoc->total_length;
                         size_t len = lineEnd - lineStart;
                         
                         WCHAR* buf = malloc((len + 1) * sizeof(WCHAR));
@@ -597,44 +929,46 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
                             while (dLen > 0 && (buf[dLen-1] == L'\n' || buf[dLen-1] == L'\r')) dLen--;
                             buf[dLen] = 0;
 
-                            // Measure text height (respecting tabs)
+                            // 1. Calculate height for this wrapped line
                             RECT measureRect = textRect;
-                            measureRect.top = currentY;
+                            measureRect.top = 0; // Use 0 for calculation to avoid overflow issues
                             DrawTextW(memDC, buf, (int)dLen, &measureRect, DT_WORDBREAK | DT_CALCRECT | DT_EXPANDTABS);
                             int height = measureRect.bottom - measureRect.top;
 
+                            // 2. Adjust height to be a multiple of our standard lineHeight
+                            // This fixes the spacing discrepancy between modes
+                            if (height < pState->lineHeight) height = pState->lineHeight;
+
+                            // 3. Draw the actual text
                             RECT drawRect = textRect;
                             drawRect.top = currentY;
                             drawRect.bottom = currentY + height;
                             
-                            // Draw actual text first
-                            DrawTextW(memDC, buf, (int)dLen, &drawRect, DT_WORDBREAK | DT_EXPANDTABS);
+                            DrawTextW(memDC, buf, (int)dLen, &drawRect, DT_WORDBREAK | DT_EXPANDTABS | DT_NOPREFIX);
 
-                            // Overlay symbols separately to prevent shifting layout
+                            // 4. Handle non-printable characters (Pilcrow)
                             if (pState->bShowNonPrintable) {
                                 COLORREF oldClr = SetTextColor(memDC, currentDim);
-                                int oldBk = SetBkMode(memDC, TRANSPARENT);
-                                
                                 if (lineEnd < pState->pDoc->total_length) {
                                     WCHAR pilcrow = 0x00B6;
-                                    DrawTextW(memDC, &pilcrow, 1, &drawRect, DT_WORDBREAK | DT_EXPANDTABS | DT_RIGHT | DT_BOTTOM);
-                                }
-                                if (i == pState->pDoc->line_count - 1) {
-                                    DrawTextW(memDC, L"[EOF]", 5, &drawRect, DT_WORDBREAK | DT_EXPANDTABS | DT_RIGHT | DT_BOTTOM);
+                                    // Draw at the bottom right of the wrapped block
+                                    DrawTextW(memDC, &pilcrow, 1, &drawRect, DT_SINGLELINE | DT_RIGHT | DT_BOTTOM | DT_NOPREFIX);
                                 }
                                 SetTextColor(memDC, oldClr);
-                                SetBkMode(memDC, oldBk);
-                                SetBkMode(memDC, OPAQUE);
                             }
+
                             free(buf);
                             currentY += height;
                         }
+                        
                         if (currentY > rc.bottom) break;
                     }
                 } else {
                     // --- NO WORD WRAP MODE ---
                     size_t first = (size_t)(pState->scrollY / pState->lineHeight);
                     size_t last = (size_t)((pState->scrollY + rc.bottom) / pState->lineHeight);
+                    int cursorLine, cursorCol;
+                    Doc_GetOffsetInfo(pState->pDoc, pState->cursorOffset, &cursorLine, &cursorCol);
                     
                     for (size_t i = first; i <= last && i < pState->pDoc->line_count; i++) {
                         size_t lineStart = Doc_GetLineOffset(pState->pDoc, i);
@@ -648,9 +982,16 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
                         
                         size_t dLen = len;
                         while (dLen > 0 && (buf[dLen-1] == L'\n' || buf[dLen-1] == L'\r')) dLen--;
+                        
+                        // Calculate a stable Y coordinate based strictly on line index
                         int lineY = (int)(((long long)i * pState->lineHeight) - (long long)pState->scrollY);
+                        // VISUAL SHIFT: If command mode is active and we are at or below the cursor, 
+                        // push the text rendering down to make room for the prompt.
+                        if (pState->bCommandMode && (int)i >= (cursorLine - 1)) {
+                            lineY += pState->lineHeight;
+                        }
 
-                        // Pass 1: Draw the background text (Tabs expand correctly)
+                        // Pass 1: Draw the background text
                         SetTextColor(memDC, currentText);
                         SetBkColor(memDC, currentBg);
                         TabbedTextOutW(memDC, 5, lineY, buf, (int)dLen, 1, &tabStops, 5);
@@ -659,11 +1000,9 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
                         if (pState->bShowNonPrintable) {
                             COLORREF oldClr = SetTextColor(memDC, currentDim);
                             SetBkMode(memDC, TRANSPARENT);
-                            
                             for (size_t k = 0; k < dLen; k++) {
                                 if (buf[k] == L' ' || buf[k] == L'\t') {
                                     WCHAR sym = (buf[k] == L' ') ? 0x00B7 : 0x00BB;
-                                    // Measure extent WITHOUT the current character to find the starting X
                                     DWORD extent = GetTabbedTextExtentW(memDC, buf, (int)k, 1, &tabStops);
                                     TextOutW(memDC, 5 + LOWORD(extent), lineY, &sym, 1);
                                 }
@@ -671,14 +1010,13 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
                             DWORD lineExtent = GetTabbedTextExtentW(memDC, buf, (int)dLen, 1, &tabStops);
                             WCHAR pilcrow = 0x00B6;
                             TextOutW(memDC, 5 + LOWORD(lineExtent), lineY, &pilcrow, 1);
-
                             if (i == pState->pDoc->line_count - 1) {
                                 TextOutW(memDC, 10 + LOWORD(lineExtent), lineY, L"[EOF]", 5);
                             }
                             SetTextColor(memDC, oldClr);
                         }
 
-                        // Pass 3: Selection Overlay (Tab aware)
+                        // Pass 3: Selection Overlay
                         if (selStart != selEnd && selStart < lineEnd && selEnd > lineStart) {
                             size_t intersectStart = (selStart > lineStart) ? selStart : lineStart;
                             size_t intersectEnd = (selEnd < lineEnd) ? selEnd : lineEnd;
@@ -701,22 +1039,9 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
                                 int selTextLen = (int)(intersectEnd - intersectStart);
                                 WCHAR* selTextPtr = buf + (intersectStart - lineStart);
                                 while (selTextLen > 0 && (selTextPtr[selTextLen-1] == L'\n' || selTextPtr[selTextLen-1] == L'\r')) selTextLen--;
-                                
                                 if (selTextLen > 0) {
                                     TabbedTextOutW(memDC, x1, lineY, selTextPtr, selTextLen, 1, &tabStops, x1);
                                 }
-                            }
-                        }
-
-                        // Update Caret Position
-                        if (pState->cursorOffset >= lineStart && pState->cursorOffset <= lineEnd) {
-                            BOOL isLastLine = (i == pState->pDoc->line_count - 1);
-                            BOOL isWithinLine = (pState->cursorOffset < lineEnd) || (isLastLine && pState->cursorOffset == lineEnd);
-                            
-                            if (isWithinLine) {
-                                DWORD caretExtent = GetTabbedTextExtentW(memDC, buf, (int)(pState->cursorOffset - lineStart), 1, &tabStops);
-                                int caretX = 5 + LOWORD(caretExtent);
-                                if (lineY >= 0 && lineY < rc.bottom) SetCaretPos(caretX, lineY);
                             }
                         }
                         free(buf);
@@ -724,7 +1049,37 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
                 }
             }
 
+            // --- 4. COMMAND MODE OVERLAY ---
+            // Draw this LAST so it appears on top of the text, regardless of scroll position
+            if (pState->bCommandMode) {
+                int cursorLine, cursorCol;
+                Doc_GetOffsetInfo(pState->pDoc, pState->cursorOffset, &cursorLine, &cursorCol);
+                
+                // Calculate position relative to the cursor's current line
+                int promptY = ((cursorLine - 1) * pState->lineHeight) - pState->scrollY;
+
+                // Ensure prompt is within visible bounds before drawing
+                if (promptY >= 0 && promptY < rc.bottom) {
+                    RECT promptRect = { 0, promptY, rc.right, promptY + pState->lineHeight };
+                    
+                    // Draw a solid background for the prompt to ensure legibility
+                    HBRUSH hPromptBg = CreateSolidBrush(RGB(240,234,221)); // Light beige background
+                    FillRect(memDC, &promptRect, hPromptBg);
+                    DeleteObject(hPromptBg);
+
+                    WCHAR szFull[260];
+                    swprintf(szFull, 260, L":%s", pState->szCommandBuf);
+                    
+                    SetTextColor(memDC, currentText); // Distinctive red for command mode
+                    SetBkMode(memDC, TRANSPARENT);
+                    TabbedTextOutW(memDC, 5, promptY, szFull, (int)wcslen(szFull), 0, NULL, 5);
+                }
+            }
+
+            // Update Caret Position and flip buffers
+            UpdateCaretPosition(hwnd, pState);
             BitBlt(hdc, 0, 0, rc.right, rc.bottom, memDC, 0, 0, SRCCOPY);
+            
             SelectObject(memDC, oldBM);
             DeleteObject(memBM);
             DeleteDC(memDC);
@@ -818,6 +1173,12 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
         case WM_LBUTTONDOWN: {
             // Ensure the window has focus so the caret appears
             SetFocus(hwnd);
+
+            // Dismiss command mode if active
+            if (pState->bCommandMode) {
+                    pState->bCommandMode = FALSE;
+                    InvalidateRect(hwnd, NULL, TRUE);
+            }
 
             // Convert click coordinates to a logical document offset
             size_t offset = GetOffsetFromPoint(hwnd, pState, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));

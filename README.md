@@ -1,6 +1,8 @@
 # Notepad Clone
 
-A simple Notepad clone written in C using the Win32 API and Common Controls.
+A calm, liminal tool for text — built for large files, quiet focus, and the spaces in between.
+
+This editor is intentionally simple. It’s designed to sit somewhere between a scratchpad and a file editor: fast to open, comfortable to keep running, and capable of handling very large text files without ceremony. There are no projects, tabs, or IDE features — just a persistent space for reading, writing, and making small, deliberate changes without friction or distraction
 
 ## Features
 

@@ -24,6 +24,10 @@ typedef struct {
     COLORREF colorText;
     COLORREF colorDim;  // For non-printables
     BOOL bUseSystemColors;
+    BOOL bCommandMode;
+    WCHAR szCommandBuf[256];
+    size_t commandLen;
+    size_t commandCaretPos;
 } ViewState;
 
 // Register the custom "SlateView" window class

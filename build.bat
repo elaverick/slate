@@ -23,7 +23,7 @@ if %ERRORLEVEL% EQU 0 (
     echo Executable created: %OUT_DIR%\%EXE_NAME%
 ) else (
     echo Build failed!
-    exit /b 1
+    exit /b %ERRORLEVEL%
 )
 
 endlocal
