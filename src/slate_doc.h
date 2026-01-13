@@ -9,7 +9,7 @@ typedef struct Piece {
     BufferType buffer;
     size_t start;
     size_t length;
-    BOOL isUtf8;       // NEW: TRUE for original UTF-8 pieces, FALSE for ADD (always UTF-16)
+    BOOL isUtf8;       // TRUE for original UTF-8 pieces, FALSE for ADD buffer text (always UTF-16)
     struct Piece* next;
 } Piece;
 

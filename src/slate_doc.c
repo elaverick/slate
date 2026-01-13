@@ -27,7 +27,7 @@ static Piece* SplitPiece(SlateDoc* doc, size_t offset) {
         if (offset > cumulative && offset < cumulative + curr->length) {
             size_t splitPoint = offset - cumulative;
             
-            // KEY FIX: The new piece inherits the isUtf8 flag from the original
+            // Preserve encoding flag when splitting the piece
             Piece* secondHalf = CreatePiece(curr->buffer, curr->start + splitPoint, 
                                             curr->length - splitPoint, curr->isUtf8);
             if (secondHalf) {
@@ -121,7 +121,7 @@ void FreePieceList(Piece* head) {
 void Doc_UpdateLineMap(SlateDoc* doc) {
     if (!doc) return;
 
-    // 1. Reset line map
+    // Reset line map storage
     if (doc->line_offsets) {
         free(doc->line_offsets);
     }
@@ -137,7 +137,7 @@ void Doc_UpdateLineMap(SlateDoc* doc) {
 
     while (curr) {
         if (curr->buffer == BUFFER_ORIGINAL && curr->isUtf8) {
-            // SAFE UTF-8 SCAN: Treat original_buffer as char*
+            // Scan UTF-8 data by treating original_buffer as char*
             const char* buf = (const char*)doc->original_buffer;
             for (size_t i = 0; i < curr->length; i++) {
                 if (buf[curr->start + i] == '\n') {
@@ -149,7 +149,7 @@ void Doc_UpdateLineMap(SlateDoc* doc) {
                 }
             }
         } else {
-            // SAFE UTF-16 SCAN: Treat as WCHAR*
+            // Scan UTF-16 data by treating the buffer as WCHAR*
             const WCHAR* buf = (curr->buffer == BUFFER_ORIGINAL) ? 
                                (WCHAR*)doc->original_buffer : doc->add_buffer;
             if (buf) {
@@ -183,10 +183,10 @@ void Doc_ClearUndoStack(SlateDoc* pDoc) {
     while (current) {
         UndoStep* nextStep = current->next;
 
-        // 1. Free the snapshot of the pieces
+        // Free the snapshot of the pieces
         FreePieceList(current->pieces);
 
-        // 2. Free the step container
+        // Free the step container
         free(current);
 
         current = nextStep;
@@ -202,17 +202,16 @@ void Doc_ClearRedoStack(SlateDoc* pDoc) {
     while (current) {
         UndoStep* nextStep = current->next;
 
-        // 1. Free the deep-copied piece list for this step
-        // This uses the helper we created earlier
+        // Free the deep-copied piece list for this step
         FreePieceList(current->pieces);
 
-        // 2. Free the step container itself
+        // Free the step container itself
         free(current);
 
         current = nextStep;
     }
 
-    // 3. Mark the stack as empty
+    // Mark the stack as empty
     pDoc->redo_stack = NULL;
 }
 
@@ -235,15 +234,14 @@ void Doc_PushUndo(SlateDoc* pDoc, size_t currentCursor, BOOL isNewAction) {
 BOOL Doc_Undo(SlateDoc* pDoc, size_t* outCursor) {
     if (!pDoc->undo_stack) return FALSE;
 
-    // 1. Before we restore the old state, save the CURRENT state to Redo
-    // This allows us to "undo the undo"
+    // Before restoring the old state, save the current state to Redo so we can undo the undo
     UndoStep* redoStep = malloc(sizeof(UndoStep));
     redoStep->cursor_hint = *outCursor; // Save current cursor position
     redoStep->pieces = ClonePieceList(pDoc->head);
     redoStep->next = pDoc->redo_stack;
     pDoc->redo_stack = redoStep;
 
-    // 2. Now perform the restoration as before
+    // Restore the previous state
     UndoStep* step = pDoc->undo_stack;
     pDoc->undo_stack = step->next;
 
@@ -260,19 +258,17 @@ BOOL Doc_Undo(SlateDoc* pDoc, size_t* outCursor) {
 BOOL Doc_Redo(SlateDoc* pDoc, size_t* outCursor) {
     if (!pDoc || !pDoc->redo_stack) return FALSE;
 
-    // 1. POP from the Redo stack
+    // Pop from the redo stack
     UndoStep* step = pDoc->redo_stack;
     pDoc->redo_stack = step->next;
 
-    // 2. PUSH current state to Undo stack before we overwrite it
-    // Use your existing PushUndo which clones the list
+    // Push current state to the undo stack before overwriting it
     Doc_PushUndo(pDoc, *outCursor, FALSE);
 
-    // 3. CLEAN UP current active piece list
+    // Clear the current active piece list
     FreePieceList(pDoc->head);
 
-    // 4. RESTORE the pieces from the Redo step
-    // We take ownership of the pieces stored in the 'step'
+    // Restore the pieces from the redo step and take ownership of them
     pDoc->head = step->pieces; 
     
     // Update the cursor hint
@@ -280,10 +276,10 @@ BOOL Doc_Redo(SlateDoc* pDoc, size_t* outCursor) {
         *outCursor = step->cursor_hint;
     }
 
-    // 5. REBUILD the line map for the restored state
+    // Rebuild the line map for the restored state
     Doc_RefreshMetadata(pDoc);
 
-    // 6. Free ONLY the container, not the pieces (pDoc owns them now)
+    // Free only the container; the document now owns the pieces
     free(step);
     
     return TRUE;
@@ -339,12 +335,10 @@ void Doc_Destroy(SlateDoc* doc) {
 BOOL Doc_Insert(SlateDoc* doc, size_t offset, const WCHAR* text, size_t len) {
     if (!doc || offset > doc->total_length) return FALSE;
 
-    // 1. Maintain Undo History
-    // Note: Ensure Doc_PushUndo is implemented in your slate_doc.c
-    // If you haven't implemented it yet, you can comment this out temporarily.
-    // Doc_PushUndo(doc, offset, TRUE);
+    // Maintain undo history
+    Doc_PushUndo(doc, offset, TRUE);
 
-    // 2. Ensure space in the ADD buffer (the buffer for new typing)
+    // Ensure space in the ADD buffer (the buffer for new typing)
     if (doc->add_len + len > doc->add_capacity) {
         size_t new_cap = (doc->add_len + len) * 2;
         WCHAR* new_buf = (WCHAR*)realloc(doc->add_buffer, new_cap * sizeof(WCHAR));
@@ -353,12 +347,12 @@ BOOL Doc_Insert(SlateDoc* doc, size_t offset, const WCHAR* text, size_t len) {
         doc->add_capacity = new_cap;
     }
 
-    // 3. Copy new text to the end of the ADD buffer
+    // Copy new text to the end of the ADD buffer
     size_t add_start_index = doc->add_len;
     memcpy(doc->add_buffer + add_start_index, text, len * sizeof(WCHAR));
     doc->add_len += len;
 
-    // 4. Piece Table Manipulation
+    // Insert a new piece into the table
     if (offset == 0) {
         // Insert at very beginning
         // All new additions are UTF-16, so isUtf8 is FALSE
@@ -405,8 +399,7 @@ BOOL Doc_Insert(SlateDoc* doc, size_t offset, const WCHAR* text, size_t len) {
         }
     }
 
-    // 5. Update Metadata
-    // RefreshMetadata scans all pieces (UTF-8 and UTF-16) to rebuild the line map
+    // Update metadata and line map
     Doc_RefreshMetadata(doc);
     
     // Explicitly update line map if it's a separate UI requirement
@@ -418,15 +411,14 @@ BOOL Doc_Insert(SlateDoc* doc, size_t offset, const WCHAR* text, size_t len) {
 BOOL Doc_Delete(SlateDoc* doc, size_t offset, size_t len) {
     if (!doc || len == 0 || offset + len > doc->total_length) return FALSE;
     
-    // 1. Snapshot state before modification
+    // Snapshot state before modification
     Doc_PushUndo(doc, offset, TRUE);
 
-    // 2. Split at the START and END of the range to delete
-    // Note: SplitPiece must handle the isUtf8 flag during the split (implemented below)
+    // Split at the start and end of the range to delete
     SplitPiece(doc, offset);
     Piece* after = SplitPiece(doc, offset + len);
 
-    // 3. Unlink and free the pieces within the range
+    // Unlink and free the pieces within the range
     if (offset == 0) {
         Piece* curr = doc->head;
         while (curr && curr != after) {
@@ -456,8 +448,7 @@ BOOL Doc_Delete(SlateDoc* doc, size_t offset, size_t len) {
         }
     }
 
-    // 4. Critical Metadata Refresh
-    // This recalculates total_length and rebuilds the line_offsets map
+    // Refresh metadata and rebuild the line map
     Doc_RefreshMetadata(doc);
     Doc_UpdateLineMap(doc);
     
@@ -479,7 +470,7 @@ size_t Doc_GetText(SlateDoc* doc, size_t offset, size_t len, WCHAR* dest) {
             if (takeFromPiece > (len - destPos)) takeFromPiece = (len - destPos);
 
             if (curr->buffer == BUFFER_ORIGINAL && curr->isUtf8) {
-                // FIX: Convert UTF-8 on-the-fly for the view
+                // Convert UTF-8 on-the-fly for the view
                 MultiByteToWideChar(CP_UTF8, 0, ((char*)doc->original_buffer) + curr->start + startInPiece, 
                                    (int)takeFromPiece, dest + destPos, (int)takeFromPiece);
             } else {

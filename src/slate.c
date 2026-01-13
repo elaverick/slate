@@ -39,6 +39,13 @@ HMENU CreateMenuBar(void) {
     AppendMenu(hEditMenu, MF_STRING, ID_EDIT_SELECT_ALL, _T("Select &All\tCtrl+A"));
     AppendMenu(hMenuBar, MF_POPUP, (UINT_PTR)hEditMenu, _T("&Edit"));
 
+    // View Menu
+    HMENU hViewMenu = CreatePopupMenu();
+    AppendMenu(hViewMenu, MF_STRING, ID_VIEW_WORDWRAP, _T("&Word Wrap"));
+    AppendMenu(hViewMenu, MF_STRING, ID_VIEW_NONPRINTABLE, _T("&Show Whitespace"));
+    AppendMenu(hViewMenu, MF_STRING, ID_VIEW_SYSTEMCOLORS, _T("&Use System Colors"));
+    AppendMenu(hMenuBar, MF_POPUP, (UINT_PTR)hViewMenu, _T("&View"));
+
     // Help menu
     HMENU hHelpMenu = CreatePopupMenu();
     AppendMenu(hHelpMenu, MF_STRING, ID_HELP_ABOUT, _T("&About Slate..."));
@@ -80,6 +87,13 @@ void UpdateStatusBar(SLATE_APP* app) {
     // Caps lock check
     BOOL caps = (GetKeyState(VK_CAPITAL) & 0x0001) != 0;
     SendMessage(app->hStatus, SB_SETTEXT, STATUS_PART_CAPS, (LPARAM)(caps ? _T("CAPS") : _T("")));
+
+    BOOL showWS = View_GetShowNonPrintable(app->hEdit);
+
+    // Use the Unicode literal for the Pilcrow symbol (¶)
+    // We add a leading space for better visual centering in the pane
+    LPCTSTR pszWS = showWS ? _T(" \xB6") : _T("");
+    SendMessage(app->hStatus, SB_SETTEXT, STATUS_PART_VIEWMODE, (LPARAM)pszWS);
 }
 
 /**
@@ -97,7 +111,7 @@ BOOL LoadFile(SLATE_APP* app, const TCHAR* pszFileName) {
         return (BOOL)SendMessage(app->hwnd, WM_COMMAND, ID_FILE_NEW, 0); 
     }
 
-    // 1. Detect Encoding
+    // Detect encoding
     BYTE bom[3] = {0};
     DWORD dwRead;
     ReadFile(hFile, bom, 3, &dwRead, NULL);
@@ -119,7 +133,7 @@ BOOL LoadFile(SLATE_APP* app, const TCHAR* pszFileName) {
         skip = 0;
     }
 
-    // 2. Map the file into memory
+    // Map the file into memory
     HANDLE hMap = CreateFileMapping(hFile, NULL, PAGE_READONLY, 0, 0, NULL);
     if (!hMap) {
         CloseHandle(hFile);
@@ -133,7 +147,7 @@ BOOL LoadFile(SLATE_APP* app, const TCHAR* pszFileName) {
         return FALSE;
     }
 
-    // 3. Initialize Document with Lazy-Loading pointers
+    // Initialize document with lazy-loading pointers
     void* pTextStart = (BYTE*)pMapViewBase + skip;
     size_t rawLen = (size_t)(liSize.QuadPart - skip);
     
@@ -151,7 +165,7 @@ BOOL LoadFile(SLATE_APP* app, const TCHAR* pszFileName) {
         return FALSE;
     }
 
-    // 4. Update Application State
+    // Update application state
     if (app->pDoc) Doc_Destroy(app->pDoc);
     app->pDoc = pNewDoc;
 
@@ -233,8 +247,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             // Create the Status Bar
             g_app.hStatus = CreateStatusWindow(WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 
                                              _T("Ready"), hwnd, IDC_STATUSBAR);
-            int parts[] = { 150, 250, 350 };
-            SendMessage(g_app.hStatus, SB_SETPARTS, 3, (LPARAM)parts);
+            int parts[] = { 150, 250, 350, 380 };
+            SendMessage(g_app.hStatus, SB_SETPARTS, 4, (LPARAM)parts);
 
             // Create the Virtual Viewport
             HINSTANCE hInst = ((LPCREATESTRUCT)lParam)->hInstance;
@@ -263,11 +277,20 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
         }
 
         case WM_COMMAND: {
-            if (LOWORD(wParam) == IDC_EDITOR && HIWORD(wParam) == EN_CHANGE) {
-                g_app.bIsModified = TRUE;
-                UpdateTitleBar(&g_app);
-                UpdateStatusBar(&g_app);
-                return 0;
+            if (LOWORD(wParam) == IDC_EDITOR) {
+                switch (HIWORD(wParam)) {
+                    case EN_CHANGE:
+                        // Content changed: Mark dirty AND update status
+                        g_app.bIsModified = TRUE;
+                        UpdateTitleBar(&g_app);
+                        UpdateStatusBar(&g_app);
+                        return 0;
+                    
+                    case EN_SELCHANGE:
+                        // Cursor moved: Update status ONLY (Do NOT mark dirty)
+                        UpdateStatusBar(&g_app);
+                        return 0;
+                }
             }
             
             switch (LOWORD(wParam)) {
@@ -350,6 +373,51 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 case ID_EDIT_PASTE:
                     View_Paste(g_app.hEdit);
                     break;
+                
+                // Handle Word Wrap Toggle
+                case ID_VIEW_WORDWRAP: {
+                    HMENU hMenu = GetMenu(hwnd);
+                    UINT state = GetMenuState(hMenu, ID_VIEW_WORDWRAP, MF_BYCOMMAND);
+                    BOOL bWrap = (state & MF_CHECKED) ? FALSE : TRUE;
+                    
+                    // Toggle the checkmark
+                    CheckMenuItem(hMenu, ID_VIEW_WORDWRAP, MF_BYCOMMAND | (bWrap ? MF_CHECKED : MF_UNCHECKED));
+                    
+                    // Tell the View to switch modes
+                    View_SetWordWrap(g_app.hEdit, bWrap);
+                    return 0;
+                }
+
+                case ID_VIEW_NONPRINTABLE: {
+                    HMENU hMenu = GetMenu(hwnd);
+                    BOOL bNewState = !View_GetShowNonPrintable(g_app.hEdit);
+                    
+                    CheckMenuItem(hMenu, ID_VIEW_NONPRINTABLE, MF_BYCOMMAND | (bNewState ? MF_CHECKED : MF_UNCHECKED));
+                    View_SetShowNonPrintable(g_app.hEdit, bNewState);
+                    UpdateStatusBar(&g_app); // To update the "NP" indicator
+                    return 0;
+                }
+
+                case ID_VIEW_SYSTEMCOLORS: {
+                    HMENU hMenu = GetMenu(hwnd);
+                    // Get current state from the EDITOR handle
+                    BOOL bIsSystem = View_IsUsingSystemColors(g_app.hEdit);
+                    BOOL bNewState = !bIsSystem;
+
+                    // Toggle colors on the EDITOR handle
+                    if (bNewState) {
+                        View_UseSystemColors(g_app.hEdit);
+                    } else {
+                        View_SetDefaultColors(g_app.hEdit);
+                    }
+                    
+                    // Update the menu checkmark
+                    CheckMenuItem(hMenu, ID_VIEW_SYSTEMCOLORS, MF_BYCOMMAND | (bNewState ? MF_CHECKED : MF_UNCHECKED));
+                    
+                    // Refresh the UI
+                    InvalidateRect(g_app.hEdit, NULL, TRUE);
+                    break;
+                }
 
                 case ID_HELP_ABOUT:
                     MessageBox(hwnd, _T("Slate Editor v2.0\nMemory-Mapped Piece Table Edition"), 

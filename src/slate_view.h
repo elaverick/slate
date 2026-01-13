@@ -5,6 +5,10 @@
 #include <windowsx.h>
 #include "slate_doc.h"
 
+#ifndef EN_SELCHANGE
+#define EN_SELCHANGE        0x8002
+#endif
+
 typedef struct {
     SlateDoc* pDoc;
     int scrollY;
@@ -14,6 +18,12 @@ typedef struct {
     size_t selectionAnchor; // This is where the selection started
     BOOL isDragging;
     BOOL bInsertMode;
+    BOOL bWordWrap;
+    BOOL bShowNonPrintable;
+    COLORREF colorBg;
+    COLORREF colorText;
+    COLORREF colorDim;  // For non-printables
+    BOOL bUseSystemColors;
 } ViewState;
 
 // Register the custom "SlateView" window class
@@ -30,7 +40,13 @@ void View_SelectAll(HWND hwnd);
 void View_Copy(HWND hwnd);
 void View_Cut(HWND hwnd);
 void View_Paste(HWND hwnd);
+void View_SetWordWrap(HWND hwnd, BOOL bWrap);
+void View_SetShowNonPrintable(HWND hwnd, BOOL bShow);
+void View_SetDefaultColors(HWND hwnd);
+void View_UseSystemColors(HWND hwnd);
 
+BOOL View_GetShowNonPrintable(HWND hwnd);
 BOOL View_IsInsertMode(HWND hwnd);
+BOOL View_IsUsingSystemColors(HWND hwnd);
 
 #endif
