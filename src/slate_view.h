@@ -4,10 +4,21 @@
 #include <windows.h>
 #include <windowsx.h>
 #include "slate_doc.h"
+#include "slate_commands.h"
 
 #ifndef EN_SELCHANGE
 #define EN_SELCHANGE        0x8002
 #endif
+
+#ifndef IDT_CARET
+#define IDT_CARET 1001
+#endif
+
+#ifndef M_PI
+    #define M_PI 3.14159265358979323846
+#endif
+
+#define CARET_IDLE_TIMEOUT 12000 // ms before switching to idle caret animation
 
 typedef struct {
     SlateDoc* pDoc;
@@ -21,6 +32,7 @@ typedef struct {
     BOOL bWordWrap;
     BOOL bShowNonPrintable;
     COLORREF colorBg;
+    COLORREF colorBgDim;
     COLORREF colorText;
     COLORREF colorDim;  // For non-printables
     BOOL bUseSystemColors;
@@ -28,6 +40,12 @@ typedef struct {
     WCHAR szCommandBuf[256];
     size_t commandLen;
     size_t commandCaretPos;
+    HBITMAP hCaretBm;  // Persistent bitmap for the caret
+    float caretAlpha;          // 0.0 to 1.0
+    int   caretDirection;      // 1 for fading in, -1 for fading out
+    double animationTime; // Total elapsed time in milliseconds
+    DWORD lastActivity;        // Timestamp of last key press
+    int   caretX, caretY;      // Current position
 } ViewState;
 
 // Register the custom "SlateView" window class

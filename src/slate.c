@@ -432,11 +432,32 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
 
         case WM_CLOSE:
-            if (PromptSaveIfModified(&g_app) != IDCANCEL) {
+            BOOL bForceClose = (BOOL)wParam;
+            if(bForceClose)
+            {
+                if (g_app.pDoc) Doc_Destroy(g_app.pDoc);
+                    DestroyWindow(hwnd);
+                return 0;
+            } else if (PromptSaveIfModified(&g_app) != IDCANCEL) {
                 if (g_app.pDoc) Doc_Destroy(g_app.pDoc);
                 DestroyWindow(hwnd);
             }
             return 0;
+
+        case WM_APP_SAVE_FILE:
+            const WCHAR* filename = (const WCHAR*)lParam;
+
+            if(filename && *filename)
+            {
+                SaveFile(&g_app, filename);
+            }
+            else if (_tcslen(g_app.szFileName) > 0) {
+                SaveFile(&g_app, g_app.szFileName);
+            } else {
+                SendMessage(hwnd, WM_COMMAND, ID_FILE_SAVE_AS, 0);
+            }
+            return 0;
+
 
         case WM_DESTROY:
             PostQuitMessage(0);

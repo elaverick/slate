@@ -16,7 +16,7 @@ cl /nologo /W4 /MD /DWIN32 /D_WINDOWS /DUNICODE /D_UNICODE ^
    /Fe"%OUT_DIR%\%EXE_NAME%" ^
    "%SRC_DIR%\main.c" "%SRC_DIR%\slate_doc.c" "%SRC_DIR%\slate_view.c" "%SRC_DIR%\slate.c" ^
    /link /SUBSYSTEM:WINDOWS ^
-         user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib
+         user32.lib gdi32.lib comctl32.lib comdlg32.lib shell32.lib msimg32.lib
 
 if %ERRORLEVEL% EQU 0 (
     echo Build successful!

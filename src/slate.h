@@ -18,6 +18,7 @@
 #include <shellapi.h>
 
 #include "slate_doc.h"
+#include "slate_commands.h"
 
 // Application constants
 #define APP_NAME            _T("Slate")
@@ -27,28 +28,6 @@
 
 #define IDC_EDITOR           5001
 #define IDC_STATUSBAR        5002
-
-// Menu command IDs
-#define ID_FILE_NEW          1001
-#define ID_FILE_OPEN         1002
-#define ID_FILE_SAVE         1003
-#define ID_FILE_SAVE_AS      1004
-#define ID_FILE_EXIT         1005
-
-#define ID_EDIT_UNDO         2001
-#define ID_EDIT_REDO         2002
-#define ID_EDIT_CUT          2003
-#define ID_EDIT_COPY         2004
-#define ID_EDIT_PASTE        2005
-#define ID_EDIT_DELETE       2006
-#define ID_EDIT_SELECT_ALL   2007
-
-#define ID_VIEW_WORDWRAP     3001
-#define ID_VIEW_NONPRINTABLE 3002
-#define ID_VIEW_SYSTEMCOLORS 3003   
-
-#define ID_HELP_HELP         4001
-#define ID_HELP_ABOUT        4002
 
 // Status bar parts
 #define STATUS_PART_CURSOR   0
