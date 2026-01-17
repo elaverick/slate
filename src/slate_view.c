@@ -313,17 +313,15 @@ void UpdateScrollbars(HWND hwnd, ViewState* pState) {
 void DrawCustomCaret(HDC hdc, ViewState* pState) {
     if (pState->caretAlpha <= 0.01f || !pState->hCaretBm) return;
 
-    int iBeamWidth = 7;
     HDC hdcMem = CreateCompatibleDC(hdc);
     HBITMAP hOld = (HBITMAP)SelectObject(hdcMem, pState->hCaretBm);
 
     BLENDFUNCTION bf = { AC_SRC_OVER, 0, (BYTE)(pState->caretAlpha * 255), 0 };
 
-    // Center the I-Beam on caretX
-    int drawX = pState->caretX - (iBeamWidth / 2);
+    int drawX = pState->caretX;
 
-    AlphaBlend(hdc, drawX, pState->caretY, iBeamWidth, pState->lineHeight, 
-               hdcMem, 0, 0, iBeamWidth, pState->lineHeight, bf);
+    AlphaBlend(hdc, drawX, pState->caretY, 1, pState->lineHeight, 
+               hdcMem, 0, 0, 1, pState->lineHeight, bf);
 
     SelectObject(hdcMem, hOld);
     DeleteDC(hdcMem);
@@ -840,7 +838,7 @@ static LRESULT HandleCreate(HWND hwnd) {
     // 2. Create Font
     pState->hFont = CreateFont(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, 
                                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, 
-                               CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
+                               CLEARTYPE_QUALITY, FIXED_PITCH | FF_MODERN, L"Cascade Mono");
 
     // 3. Use one HDC for all GDI initialization
     HDC hdc = GetDC(hwnd);
@@ -855,35 +853,16 @@ static LRESULT HandleCreate(HWND hwnd) {
 
     // Create and initialize the persistent Caret Bitmap
     // We reuse the 'hdc' here to ensure the bitmap is compatible with the window
-    int iBeamWidth = 7;
-    pState->hCaretBm = CreateCompatibleBitmap(hdc, iBeamWidth, pState->lineHeight);
+    pState->hCaretBm = CreateCompatibleBitmap(hdc, 1, pState->lineHeight);
     
     HDC hMemDC = CreateCompatibleDC(hdc);
     HGDIOBJ hOldBm = SelectObject(hMemDC, pState->hCaretBm);
-    
-    //TODO: Caret currently has large white background when rendered with AlphaBlend.
+    // Clear then fill the 1px caret bitmap
+    PatBlt(hMemDC, 0, 0, 1, pState->lineHeight, BLACKNESS);
+    RECT rcFull = { 0, 0, 1, pState->lineHeight };
+    FillRect(hMemDC, &rcFull, (HBRUSH)GetStockObject(BLACK_BRUSH));
 
-    // 1. FILL BACKGROUND WITH BLACK (0,0,0)
-    // This represents 0 alpha/0 color in the blending math
-    RECT rcFull = { 0, 0, iBeamWidth, pState->lineHeight };
-    FillRect(hMemDC, &rcFull, (HBRUSH)GetStockObject(WHITE_BRUSH)); 
-
-    // 2. DRAW I-BEAM IN WHITE
-    // We draw in White so that it is visible over any background when blended
-    HPEN hPen = CreatePen(PS_SOLID, 1, RGB(0, 0, 0));
-    HGDIOBJ hOldPen = SelectObject(hMemDC, hPen);
-
-    int midX = iBeamWidth / 2;
-    MoveToEx(hMemDC, midX, 0, NULL);
-    LineTo(hMemDC, midX, pState->lineHeight);
-    MoveToEx(hMemDC, 0, 0, NULL);
-    LineTo(hMemDC, iBeamWidth, 0);
-    MoveToEx(hMemDC, 0, pState->lineHeight - 1, NULL);
-    LineTo(hMemDC, iBeamWidth, pState->lineHeight - 1);
-    
     // Cleanup
-    SelectObject(hMemDC, hOldPen);
-    DeleteObject(hPen);
     SelectObject(hMemDC, hOldBm);
     DeleteDC(hMemDC);
 
@@ -897,7 +876,7 @@ static LRESULT HandleCreate(HWND hwnd) {
     UpdateScrollbars(hwnd, pState);
 
     // Create system caret for accessibility (but don't call ShowCaret)
-    CreateCaret(hwnd, NULL, 2, pState->lineHeight);
+    CreateCaret(hwnd, NULL, 1, pState->lineHeight);
     
     return 0;
 }
@@ -941,11 +920,11 @@ static LRESULT HandleTimer(HWND hwnd, ViewState* pState, WPARAM wParam) {
     pState->caretAlpha = alpha;
 
     // Trigger redraw for caret only
-    int iBeamWidth = 7;
+    int caretWidth = 1;
     RECT rcCaret = { 
-        pState->caretX - (iBeamWidth / 2), 
+        pState->caretX - (caretWidth / 2), 
         pState->caretY, 
-        pState->caretX + (iBeamWidth / 2) + 1, 
+        pState->caretX + (caretWidth / 2) + 1, 
         pState->caretY + pState->lineHeight 
     };
     InvalidateRect(hwnd, &rcCaret, FALSE);
@@ -1611,7 +1590,7 @@ static LRESULT HandleSize(HWND hwnd, ViewState* pState, WPARAM wParam, LPARAM lP
 }
 
 static LRESULT HandleSetFocus(HWND hwnd, ViewState* pState) {
-    CreateCaret(hwnd, NULL, 2, pState->lineHeight); //
+    CreateCaret(hwnd, NULL, 1, pState->lineHeight); //
     ResetCaretBlink(pState);
     
     // Start the animation only when focused
