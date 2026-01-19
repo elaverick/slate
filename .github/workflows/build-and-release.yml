@@ -33,6 +33,7 @@ jobs:
         run: build.bat
 
       - name: Build Installer
+        shell: cmd
         run: |
           makensis installer\slate.nsi
       
