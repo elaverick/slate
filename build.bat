@@ -1,11 +1,6 @@
 @echo off
 setlocal
 
-where cl >nul 2>nul || (
-  echo MSVC cl.exe not found. Did you run vcvarsall?
-  exit /b 1
-)
-
 REM Set up the build environment
 set ROOT_DIR=%~dp0
 set SRC_DIR=%ROOT_DIR%src
