@@ -17,6 +17,7 @@ jobs:
         run: choco install nsis
       
       - name: Add NSIS to PATH
+        shell: cmd
         run: |
           echo C:\ProgramData\chocolatey\lib\nsis\tools >> "%GITHUB_PATH%"
 
