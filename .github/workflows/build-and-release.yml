@@ -14,14 +14,11 @@ jobs:
 
     steps:
       - name: Install NSIS
-        uses: chocolatey/install@v1
-        with:
-          package: nsis
+        run: choco install nsis
       
-          
       - name: Add NSIS to PATH
         run: |
-          echo "##[add-path]C:\ProgramData\chocolatey\lib\nsis\tools" >> $GITHUB_PATH
+          echo C:\ProgramData\chocolatey\lib\nsis\tools >> "%GITHUB_PATH%"
 
       - name: Checkout
         uses: actions/checkout@v4
