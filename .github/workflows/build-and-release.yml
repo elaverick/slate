@@ -22,6 +22,7 @@ jobs:
         run: build.bat
       
       - name: Verify artifact
+        shell: cmd
         run: |
           if not exist build\slate.exe exit 1
 
