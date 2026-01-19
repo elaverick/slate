@@ -29,8 +29,9 @@ jobs:
 
       - name: Build Installer
         shell: cmd
+        working-directory: ${{ github.workspace }}\installer
         run: |
-          "C:\ProgramData\chocolatey\lib\nsis\tools\makensis.exe" installer\slate.nsi
+          "C:\ProgramData\chocolatey\lib\nsis\tools\makensis.exe" "%GITHUB_WORKSPACE%\installer\slate.nsi"
       
       - name: Verify artifact
         shell: cmd
