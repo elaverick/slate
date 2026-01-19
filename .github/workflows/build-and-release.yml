@@ -15,11 +15,6 @@ jobs:
     steps:
       - name: Install NSIS
         run: choco install nsis
-      
-      - name: Add NSIS to PATH
-        shell: cmd
-        run: |
-          echo C:\ProgramData\chocolatey\lib\nsis\tools >> "%GITHUB_PATH%"
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,7 +30,7 @@ jobs:
       - name: Build Installer
         shell: cmd
         run: |
-          makensis installer\slate.nsi
+          "C:\ProgramData\chocolatey\lib\nsis\tools\makensis.exe" installer\slate.nsi
       
       - name: Verify artifact
         shell: cmd
