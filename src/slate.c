@@ -6,6 +6,7 @@
 #include "slate.h"
 #include "slate_doc.h"
 #include "slate_view.h"
+#include "../resources/resource.h"
 
 // Global application state
 SLATE_APP g_app = {0};
@@ -276,6 +277,32 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             return 0;
         }
 
+        case WM_NOTIFY: {
+            NMHDR* pnm = (NMHDR*)lParam;
+
+            // Is this from the status bar?
+            if (pnm->hwndFrom == g_app.hStatus && pnm->code == NM_CLICK) {
+                NMMOUSE* pnmMouse = (NMMOUSE*)lParam;
+
+                // Which status bar part was clicked?
+                int part = (int)pnmMouse->dwItemSpec;
+
+                if (part == STATUS_PART_INSERT) {
+                    // Toggle insert/overtype mode
+                    BOOL isInsert = View_IsInsertMode(g_app.hEdit);
+                    View_SetInsertMode(g_app.hEdit, !isInsert);
+
+                    // Update status bar text immediately
+                    UpdateStatusBar(&g_app);
+
+                    // Give focus back to editor so typing continues naturally
+                    SetFocus(g_app.hEdit);
+                    return 0;
+                }
+            }
+            break;
+        }
+
         case WM_COMMAND: {
             if (LOWORD(wParam) == IDC_EDITOR) {
                 switch (HIWORD(wParam)) {
@@ -457,6 +484,16 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                 SendMessage(hwnd, WM_COMMAND, ID_FILE_SAVE_AS, 0);
             }
             return 0;
+        
+        case WM_APP_OPEN_FILE:
+            const WCHAR* openFilename = (const WCHAR*)lParam;
+            if(openFilename && *openFilename)
+            {
+                if (PromptSaveIfModified(&g_app) != IDCANCEL) {
+                    LoadFile(&g_app, openFilename);
+                }
+            }
+            return 0;
 
 
         case WM_DESTROY:
@@ -471,14 +508,24 @@ BOOL InitializeApplication(HINSTANCE hInstance) {
     
     if (!View_Register(hInstance)) return FALSE;
 
-    WNDCLASS wc = {0};
+    WNDCLASSEX wc = {0};
+    wc.cbSize        = sizeof(WNDCLASSEX);
     wc.lpfnWndProc   = WindowProc;
     wc.hInstance     = hInstance;
     wc.lpszClassName = WINDOW_CLASS_NAME;
     wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.hIcon         = LoadIcon(hInstance, MAKEINTRESOURCE(IDI_APP_ICON));
+    wc.hIconSm       = (HICON)LoadImage(
+        hInstance,
+        MAKEINTRESOURCE(IDI_APP_ICON),
+        IMAGE_ICON,
+        GetSystemMetrics(SM_CXSMICON),
+        GetSystemMetrics(SM_CYSMICON),
+        LR_DEFAULTCOLOR
+    );
 
-    if (!RegisterClass(&wc)) return FALSE;
+    if (!RegisterClassEx(&wc)) return FALSE;
 
     g_app.hwnd = CreateWindow(
         WINDOW_CLASS_NAME, APP_NAME,

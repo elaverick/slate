@@ -23,6 +23,7 @@
 typedef struct {
     SlateDoc* pDoc;
     int scrollY;
+    int scrollX;
     int lineHeight;
     HFONT hFont;
     size_t cursorOffset;    // This is the active end of the selection
@@ -40,6 +41,10 @@ typedef struct {
     WCHAR szCommandBuf[256];
     size_t commandLen;
     size_t commandCaretPos;
+    BOOL bCommandFeedback;
+    BOOL bCommandFeedbackHasCaret;
+    int  commandFeedbackCaretCol;
+    WCHAR szCommandFeedback[256];
     HBITMAP hCaretBm;  // Persistent bitmap for the caret
     float caretAlpha;          // 0.0 to 1.0
     int   caretDirection;      // 1 for fading in, -1 for fading out
@@ -66,6 +71,7 @@ void View_SetWordWrap(HWND hwnd, BOOL bWrap);
 void View_SetShowNonPrintable(HWND hwnd, BOOL bShow);
 void View_SetDefaultColors(HWND hwnd);
 void View_UseSystemColors(HWND hwnd);
+void View_SetInsertMode(HWND hwnd, BOOL bInsert);
 
 BOOL View_GetShowNonPrintable(HWND hwnd);
 BOOL View_IsInsertMode(HWND hwnd);

@@ -4,32 +4,18 @@
 #include <limits.h>
 #define _USE_MATH_DEFINES
 #include <math.h>
+#include <wchar.h>
 
 static int GetTotalWrappedHeight(HWND hwnd, ViewState* pState, int wrapWidth);
 static ViewState* GetState(HWND hwnd) {
     return (ViewState*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
 }
 
-// Returns TRUE when a non-empty selection exists; outputs start/len
-static BOOL View_GetSelection(const ViewState* pState, size_t* pStart, size_t* pLen) {
-    if (!pState || pState->cursorOffset == pState->selectionAnchor) return FALSE;
-    size_t a = pState->cursorOffset;
-    size_t b = pState->selectionAnchor;
-    *pStart = (a < b) ? a : b;
-    *pLen = (a < b) ? (b - a) : (a - b);
-    return TRUE;
-}
-
-// Shared document height calculation for scroll math (clamped to 32-bit)
-static int View_GetDocumentHeight(HWND hwnd, ViewState* pState, int wrapWidth) {
-    if (!pState || !pState->pDoc) return 0;
-    if (pState->bWordWrap) {
-        int totalHeight = GetTotalWrappedHeight(hwnd, pState, wrapWidth);
-        if (totalHeight <= 0) totalHeight = pState->lineHeight;
-        return (totalHeight > INT_MAX) ? INT_MAX : totalHeight;
-    }
-    long long totalHeight64 = (long long)pState->pDoc->line_count * pState->lineHeight;
-    return (totalHeight64 > 2147483647LL) ? 2147483647 : (int)totalHeight64;
+static int GetCommandSpaceHeight(const ViewState* pState) {
+    if (!pState || !pState->bCommandMode) return 0;
+    int lines = 1; // Prompt line
+    if (pState->bCommandFeedback) lines++; // Optional feedback line
+    return pState->lineHeight * lines;
 }
 
 // Allocates and trims a line; caller must free(*ppBuf). Returns trimmed length.
@@ -55,6 +41,107 @@ static BOOL View_LoadLine(ViewState* pState, size_t lineIdx, size_t* pLineStart,
     return TRUE;
 }
 
+static int GetCommandPromptTopY(ViewState* pState, HDC hdc, RECT clientRc) {
+    if (!pState || !pState->pDoc || !pState->bCommandMode) return INT_MIN;
+
+    int cursorLine, cursorCol;
+    Doc_GetOffsetInfo(pState->pDoc, pState->cursorOffset, &cursorLine, &cursorCol);
+
+    // Unwrapped coordinates are simple
+    if (!pState->bWordWrap) {
+        return ((cursorLine - 1) * pState->lineHeight) - pState->scrollY;
+    }
+
+    // Wrapped: accumulate heights for lines before the cursor line
+    int wrapWidth = clientRc.right - 10;
+    int currentY = -pState->scrollY;
+    for (size_t i = 0; i < pState->pDoc->line_count && (int)i < (cursorLine - 1); i++) {
+        size_t lineStart = 0, lineEnd = 0;
+        WCHAR* buf = NULL;
+        size_t dLen = 0;
+        if (!View_LoadLine(pState, i, &lineStart, &lineEnd, &buf, &dLen)) continue;
+
+        RECT measureRect = { 0, 0, wrapWidth, 0 };
+        DrawTextW(hdc, buf, (int)dLen, &measureRect, DT_WORDBREAK | DT_CALCRECT | DT_EXPANDTABS);
+        int height = measureRect.bottom - measureRect.top;
+        if (height < pState->lineHeight) height = pState->lineHeight;
+        currentY += height;
+        free(buf);
+    }
+    return currentY;
+}
+
+static void ClearCommandFeedback(ViewState* pState) {
+    if (!pState) return;
+    pState->bCommandFeedback = FALSE;
+    pState->bCommandFeedbackHasCaret = FALSE;
+    pState->commandFeedbackCaretCol = -1;
+    pState->szCommandFeedback[0] = L'\0';
+}
+
+static void SetCommandFeedback(ViewState* pState, const WCHAR* text, int caretCol, BOOL hasCaret) {
+    if (!pState || !text) return;
+    wcsncpy(pState->szCommandFeedback, text, _countof(pState->szCommandFeedback) - 1);
+    pState->szCommandFeedback[_countof(pState->szCommandFeedback) - 1] = L'\0';
+    pState->bCommandFeedback = TRUE;
+    pState->bCommandFeedbackHasCaret = hasCaret;
+    pState->commandFeedbackCaretCol = hasCaret ? caretCol : -1;
+}
+
+// Maximum pixel width of unwrapped content (includes 5px inset on each side)
+static int View_GetDocumentWidth(HWND hwnd, ViewState* pState) {
+    if (!pState || !pState->pDoc || pState->bWordWrap) return 0;
+
+    HDC hdc = GetDC(hwnd);
+    SelectObject(hdc, pState->hFont);
+    TEXTMETRIC tm;
+    GetTextMetrics(hdc, &tm);
+    int tabStops = tm.tmAveCharWidth * 4;
+
+    int maxWidth = 0;
+    for (size_t i = 0; i < pState->pDoc->line_count; i++) {
+        WCHAR* buf = NULL;
+        size_t dLen = 0;
+        if (!View_LoadLine(pState, i, NULL, NULL, &buf, &dLen)) continue;
+        DWORD extent = GetTabbedTextExtentW(hdc, buf, (int)dLen, 1, &tabStops);
+        int width = (int)LOWORD(extent);
+        if (width > maxWidth) maxWidth = width;
+        free(buf);
+    }
+
+    ReleaseDC(hwnd, hdc);
+    // 5px inset on each side to match draw origin of 5
+    return maxWidth + 10;
+}
+
+// Returns TRUE when a non-empty selection exists; outputs start/len
+static BOOL View_GetSelection(const ViewState* pState, size_t* pStart, size_t* pLen) {
+    if (!pState || pState->cursorOffset == pState->selectionAnchor) return FALSE;
+    size_t a = pState->cursorOffset;
+    size_t b = pState->selectionAnchor;
+    *pStart = (a < b) ? a : b;
+    *pLen = (a < b) ? (b - a) : (a - b);
+    return TRUE;
+}
+
+// Shared document height calculation for scroll math (clamped to 32-bit)
+static int View_GetDocumentHeight(HWND hwnd, ViewState* pState, int wrapWidth) {
+    if (!pState || !pState->pDoc) return 0;
+    if (pState->bWordWrap) {
+        int totalHeight = GetTotalWrappedHeight(hwnd, pState, wrapWidth);
+        if (totalHeight <= 0) totalHeight = pState->lineHeight;
+        int extra = GetCommandSpaceHeight(pState);
+        if (extra > 0) {
+            if (totalHeight > INT_MAX - extra) totalHeight = INT_MAX;
+            else totalHeight += extra;
+        }
+        return (totalHeight > INT_MAX) ? INT_MAX : totalHeight;
+    }
+    long long totalHeight64 = (long long)pState->pDoc->line_count * pState->lineHeight;
+    totalHeight64 += GetCommandSpaceHeight(pState);
+    return (totalHeight64 > 2147483647LL) ? 2147483647 : (int)totalHeight64;
+}
+
 void View_SetDefaultColors(HWND hwnd) {
     ViewState* pState = GetState(hwnd);
     if (!pState) return;
@@ -62,7 +149,7 @@ void View_SetDefaultColors(HWND hwnd) {
     pState->bUseSystemColors = FALSE;
     pState->colorBg    = RGB(0xE6, 0xE3, 0xDA);
     pState->colorBgDim = RGB(0xE6, 0xE6, 0xE6); 
-    pState->colorText  = RGB(0x1B, 0x1B, 0x1B); 
+    pState->colorText  = RGB(0x26, 0x25, 0x22); 
     pState->colorDim   = RGB(150, 150, 150);    
     InvalidateRect(hwnd, NULL, TRUE);
 }
@@ -275,8 +362,39 @@ void EnsureCursorVisible(HWND hwnd, ViewState* pState) {
             pState->scrollY = cursorY - rc.bottom + pState->lineHeight;
         }
         if (pState->scrollY < 0) pState->scrollY = 0;
+
+        // Horizontal visibility for unwrapped mode
+        HDC hdc = GetDC(hwnd);
+        SelectObject(hdc, pState->hFont);
+        TEXTMETRIC tm;
+        GetTextMetrics(hdc, &tm);
+        int tabStops = tm.tmAveCharWidth * 4;
+
+        size_t lineStart = Doc_GetLineOffset(pState->pDoc, line - 1);
+        size_t len = pState->cursorOffset - lineStart;
+        WCHAR* lineBuf = (WCHAR*)malloc((len + 1) * sizeof(WCHAR));
+        int cursorX = 5;
+        if (lineBuf) {
+            Doc_GetText(pState->pDoc, lineStart, len, lineBuf);
+            lineBuf[len] = L'\0';
+            cursorX += (int)LOWORD(GetTabbedTextExtentW(hdc, lineBuf, (int)len, 1, &tabStops));
+            free(lineBuf);
+        }
+
+        ReleaseDC(hwnd, hdc);
+
+        if (cursorX < pState->scrollX) {
+            pState->scrollX = cursorX;
+        } else if (cursorX > pState->scrollX + rc.right - 1) {
+            pState->scrollX = cursorX - rc.right + 1;
+        }
+        int maxScrollX = View_GetDocumentWidth(hwnd, pState) - rc.right;
+        if (maxScrollX < 0) maxScrollX = 0;
+        if (pState->scrollX < 0) pState->scrollX = 0;
+        if (pState->scrollX > maxScrollX) pState->scrollX = maxScrollX;
     }
     SetScrollPos(hwnd, SB_VERT, pState->scrollY, TRUE);
+    SetScrollPos(hwnd, SB_HORZ, pState->scrollX, TRUE);
 }
 
 void UpdateScrollbars(HWND hwnd, ViewState* pState) {
@@ -305,9 +423,32 @@ void UpdateScrollbars(HWND hwnd, ViewState* pState) {
         // Pixel-based scrolling (Safe 64-bit clamp)
         si.nMax = totalHeight;
         si.nPage = rc.bottom;
+        int maxScrollY = totalHeight - clientHeight;
+        if (maxScrollY < 0) maxScrollY = 0;
+        if (pState->scrollY > maxScrollY) pState->scrollY = maxScrollY;
+        si.nPos = pState->scrollY;
     }
 
     SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
+
+    // Horizontal scroll bar only matters when not wrapping
+    int clientWidth = rc.right;
+    int docWidth = pState->bWordWrap ? clientWidth : View_GetDocumentWidth(hwnd, pState);
+    SCROLLINFO siH = {0};
+    siH.cbSize = sizeof(siH);
+    siH.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+    siH.nMin = 0;
+    siH.nMax = docWidth;
+    siH.nPage = clientWidth;
+    if (pState->bWordWrap) {
+        pState->scrollX = 0;
+    } else {
+        int maxScrollX = docWidth - clientWidth;
+        if (maxScrollX < 0) maxScrollX = 0;
+        if (pState->scrollX > maxScrollX) pState->scrollX = maxScrollX;
+    }
+    siH.nPos = pState->scrollX;
+    SetScrollInfo(hwnd, SB_HORZ, &siH, TRUE);
 }
 
 void DrawCustomCaret(HDC hdc, ViewState* pState) {
@@ -333,6 +474,7 @@ void View_SetDocument(HWND hwnd, SlateDoc* pDoc) {
         pState->pDoc = pDoc;
         pState->cursorOffset = 0;
         pState->scrollY = 0;
+        pState->scrollX = 0;
         
         if (pDoc) {
             Doc_UpdateLineMap(pDoc); 
@@ -363,8 +505,22 @@ size_t View_GetCursorOffset(HWND hwnd) {
 
 // Helper to convert mouse coordinates to logical offset
 size_t GetOffsetFromPoint(HWND hwnd, ViewState* pState, int x, int y) {
+    int targetY = y;
+    if (pState->bCommandMode) {
+        RECT clientRc;
+        GetClientRect(hwnd, &clientRc);
+        HDC hdcTmp = GetDC(hwnd);
+        SelectObject(hdcTmp, pState->hFont);
+        int promptTop = GetCommandPromptTopY(pState, hdcTmp, clientRc);
+        ReleaseDC(hwnd, hdcTmp);
+        int commandSpace = GetCommandSpaceHeight(pState);
+        if (promptTop != INT_MIN && commandSpace > 0 && targetY >= promptTop + commandSpace) {
+            targetY -= commandSpace;
+        }
+    }
+
     if (pState->bWordWrap) {
-        return View_XYToOffset(hwnd, x, y);
+        return View_XYToOffset(hwnd, x, targetY);
     }
 
     HDC hdc = GetDC(hwnd);
@@ -376,7 +532,7 @@ size_t GetOffsetFromPoint(HWND hwnd, ViewState* pState, int x, int y) {
     ReleaseDC(hwnd, hdc);
 
     // Map the y coordinate to a line index
-    int lineIndex = (y + pState->scrollY) / pState->lineHeight;
+    int lineIndex = (targetY + pState->scrollY) / pState->lineHeight;
     
     // Clamp to valid line range
     if (lineIndex < 0) lineIndex = 0;
@@ -384,7 +540,7 @@ size_t GetOffsetFromPoint(HWND hwnd, ViewState* pState, int x, int y) {
         lineIndex = (int)pState->pDoc->line_count - 1;
 
     // Map the x coordinate to a column, subtracting the left margin and rounding to the nearest char
-    int col = (x - 5 + (charWidth / 2)) / charWidth;
+    int col = (x + pState->scrollX - 5 + (charWidth / 2)) / charWidth;
     
     size_t lineStart = 0, lineEnd = 0;
     size_t lineLen = 0;
@@ -418,6 +574,14 @@ size_t GetOffsetFromPoint(HWND hwnd, ViewState* pState, int x, int y) {
     if ((size_t)col > lineLen) col = (int)lineLen;
 
     return lineStart + col;
+}
+
+void View_SetInsertMode(HWND hwnd, BOOL bInsert) {
+    ViewState* pState = GetState(hwnd);
+    if (pState) {
+        pState->bInsertMode = bInsert;
+        InvalidateRect(hwnd, NULL, TRUE);
+    }
 }
 
 BOOL View_IsInsertMode(HWND hwnd) {
@@ -567,6 +731,7 @@ void View_SetWordWrap(HWND hwnd, BOOL bWrap) {
     if (pState && pState->bWordWrap != bWrap) {
         pState->bWordWrap = bWrap;
         pState->scrollY = 0; // Reset scroll to avoid getting lost
+        pState->scrollX = 0;
         UpdateScrollbars(hwnd, pState);
         InvalidateRect(hwnd, NULL, TRUE);
     }
@@ -575,13 +740,30 @@ void View_SetWordWrap(HWND hwnd, BOOL bWrap) {
 void UpdateCaretPosition(HWND hwnd, ViewState* pState) {
     if (!pState || !pState->pDoc || GetFocus() != hwnd) return;
 
-    int x = 5, y = 0; // left margin baseline; y stays client-relative
-    if (pState->bWordWrap) {
+    int x = pState->bWordWrap ? 5 : (5 - pState->scrollX);
+    int y = 0; // y stays client-relative
+    int cursorLine, cursorCol;
+    Doc_GetOffsetInfo(pState->pDoc, pState->cursorOffset, &cursorLine, &cursorCol);
+
+    if (pState->bCommandMode) {
+        HDC hdc = GetDC(hwnd);
+        SelectObject(hdc, pState->hFont);
+
+        // Measure ":text" to place the caret correctly in the prompt
+        WCHAR temp[260];
+        int len = swprintf(temp, 260, L":%.*s", (int)pState->commandCaretPos, pState->szCommandBuf);
+        SIZE sz = {0};
+        GetTextExtentPoint32W(hdc, temp, len, &sz);
+        RECT clientRc;
+        GetClientRect(hwnd, &clientRc);
+        y = GetCommandPromptTopY(pState, hdc, clientRc);
+        if (y == INT_MIN) y = 0;
+        ReleaseDC(hwnd, hdc);
+
+        x += sz.cx;
+    } else if (pState->bWordWrap) {
         GetCursorVisualPos(hwnd, pState, pState->cursorOffset, &x, &y);
     } else {
-        int cursorLine, cursorCol;
-        Doc_GetOffsetInfo(pState->pDoc, pState->cursorOffset, &cursorLine, &cursorCol);
-
         HDC hdc = GetDC(hwnd);
         SelectObject(hdc, pState->hFont);
         
@@ -589,32 +771,18 @@ void UpdateCaretPosition(HWND hwnd, ViewState* pState) {
         GetTextMetrics(hdc, &tm);
         int tabStops = tm.tmAveCharWidth * 4; // MATCH WM_PAINT EXACTLY
 
-        if (pState->bCommandMode) {
-            // The prompt always appears at the line where the cursor WAS
-            y = ((cursorLine - 1) * pState->lineHeight) - pState->scrollY;
-            
-            // Measure ":text" to place the caret correctly in the prompt
-            WCHAR temp[260];
-            int len = swprintf(temp, 260, L":%.*s", (int)pState->commandCaretPos, pState->szCommandBuf);
-            SIZE sz;
-            GetTextExtentPoint32W(hdc, temp, len, &sz);
-            x += sz.cx;
-        } else {
-            int visualLine = cursorLine - 1;
-            // If cursor is at or below the line where the command prompt is injected:
-            if (pState->bCommandMode) visualLine++; 
+        int visualLine = cursorLine - 1;
 
-            y = (visualLine * pState->lineHeight) - pState->scrollY;
+        y = (visualLine * pState->lineHeight) - pState->scrollY;
 
-            size_t lineStart = Doc_GetLineOffset(pState->pDoc, cursorLine - 1);
-            size_t len = pState->cursorOffset - lineStart;
-            WCHAR* lineBuf = (WCHAR*)malloc((len + 1) * sizeof(WCHAR));
-            if (lineBuf) {
-                    Doc_GetText(pState->pDoc, lineStart, len, lineBuf);
-                    lineBuf[len] = L'\0';
-                    x += LOWORD(GetTabbedTextExtentW(hdc, lineBuf, (int)len, 1, &tabStops));
-                free(lineBuf);
-            }
+        size_t lineStart = Doc_GetLineOffset(pState->pDoc, cursorLine - 1);
+        size_t len = pState->cursorOffset - lineStart;
+        WCHAR* lineBuf = (WCHAR*)malloc((len + 1) * sizeof(WCHAR));
+        if (lineBuf) {
+            Doc_GetText(pState->pDoc, lineStart, len, lineBuf);
+            lineBuf[len] = L'\0';
+            x += LOWORD(GetTabbedTextExtentW(hdc, lineBuf, (int)len, 1, &tabStops));
+            free(lineBuf);
         }
         ReleaseDC(hwnd, hdc);
     }
@@ -636,21 +804,11 @@ static void PaintWrappedContent(ViewState* pState, HDC memDC, RECT rc, int tabSt
     Doc_GetOffsetInfo(pState->pDoc, pState->cursorOffset, &cursorLine, &cursorCol);
 
     SetBkMode(memDC, TRANSPARENT);
+    int commandSpace = GetCommandSpaceHeight(pState);
 
     for (size_t i = 0; i < pState->pDoc->line_count; i++) {
-        // --- COMMAND PROMPT INJECTION ---
-        if (pState->bCommandMode && (int)i == (cursorLine - 1)) {
-            RECT rcPrompt = textRect;
-            rcPrompt.top = currentY;
-            rcPrompt.bottom = currentY + pState->lineHeight;
-
-            WCHAR pBuf[300];
-            int pLen = swprintf(pBuf, 300, L":%s", pState->szCommandBuf);
-            
-            // Draw the prompt text
-            DrawTextW(memDC, pBuf, pLen, &rcPrompt, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-            
-            currentY += pState->lineHeight;
+        if (commandSpace > 0 && (int)i == (cursorLine - 1)) {
+            currentY += commandSpace;
         }
 
         size_t lineStart = 0, lineEnd = 0;
@@ -727,6 +885,8 @@ static void PaintUnwrappedContent(ViewState* pState, HDC memDC, RECT rc, int tab
     int cursorLine, cursorCol;
     Doc_GetOffsetInfo(pState->pDoc, pState->cursorOffset, &cursorLine, &cursorCol);
     
+    int baseX = 5 - pState->scrollX;
+    int commandSpace = GetCommandSpaceHeight(pState);
     for (size_t i = first; i <= last && i < pState->pDoc->line_count; i++) {
         size_t lineStart = 0, lineEnd = 0;
         WCHAR* buf = NULL;
@@ -735,16 +895,14 @@ static void PaintUnwrappedContent(ViewState* pState, HDC memDC, RECT rc, int tab
         
         // Calculate a stable Y coordinate based strictly on line index
         int lineY = (int)(((long long)i * pState->lineHeight) - (long long)pState->scrollY);
-        // VISUAL SHIFT: If command mode is active and we are at or below the cursor, 
-        // push the text rendering down to make room for the prompt.
-        if (pState->bCommandMode && (int)i >= (cursorLine - 1)) {
-            lineY += pState->lineHeight;
+        if (commandSpace > 0 && (int)i >= (cursorLine - 1)) {
+            lineY += commandSpace;
         }
 
         // Pass 1: Draw the background text
         SetTextColor(memDC, currentText);
         SetBkColor(memDC, currentBg);
-        TabbedTextOutW(memDC, 5, lineY, buf, (int)dLen, 1, &tabStops, 5);
+        TabbedTextOutW(memDC, baseX, lineY, buf, (int)dLen, 1, &tabStops, baseX);
 
         // Pass 2: Overlay Symbols (Non-Printable)
         if (pState->bShowNonPrintable) {
@@ -754,14 +912,14 @@ static void PaintUnwrappedContent(ViewState* pState, HDC memDC, RECT rc, int tab
                 if (buf[k] == L' ' || buf[k] == L'\t') {
                     WCHAR sym = (buf[k] == L' ') ? 0x00B7 : 0x00BB;
                     DWORD extent = GetTabbedTextExtentW(memDC, buf, (int)k, 1, &tabStops);
-                    TextOutW(memDC, 5 + LOWORD(extent), lineY, &sym, 1);
+                    TextOutW(memDC, baseX + LOWORD(extent), lineY, &sym, 1);
                 }
             }
             DWORD lineExtent = GetTabbedTextExtentW(memDC, buf, (int)dLen, 1, &tabStops);
             WCHAR pilcrow = 0x00B6;
-            TextOutW(memDC, 5 + LOWORD(lineExtent), lineY, &pilcrow, 1);
+            TextOutW(memDC, baseX + LOWORD(lineExtent), lineY, &pilcrow, 1);
             if (i == pState->pDoc->line_count - 1) {
-                TextOutW(memDC, 10 + LOWORD(lineExtent), lineY, L"[EOF]", 5);
+                TextOutW(memDC, baseX + 5 + LOWORD(lineExtent), lineY, L"[EOF]", 5);
             }
             SetTextColor(memDC, oldClr);
         }
@@ -775,8 +933,8 @@ static void PaintUnwrappedContent(ViewState* pState, HDC memDC, RECT rc, int tab
                 DWORD ext1 = GetTabbedTextExtentW(memDC, buf, (int)(intersectStart - lineStart), 1, &tabStops);
                 DWORD ext2 = GetTabbedTextExtentW(memDC, buf, (int)(intersectEnd - lineStart), 1, &tabStops);
                 
-                int x1 = 5 + LOWORD(ext1);
-                int x2 = 5 + LOWORD(ext2);
+                int x1 = baseX + LOWORD(ext1);
+                int x2 = baseX + LOWORD(ext2);
                 RECT selRect = { x1, lineY, x2, lineY + pState->lineHeight };
 
                 HBRUSH hSelBrush = CreateSolidBrush(hasFocus ? GetSysColor(COLOR_HIGHLIGHT) : GetSysColor(COLOR_3DFACE));
@@ -802,28 +960,63 @@ static void PaintCommandOverlay(ViewState* pState, HDC memDC, RECT rc) {
     // Draw this LAST so it appears on top of the text, regardless of scroll position
     if (!pState->bCommandMode) return;
 
-    int cursorLine, cursorCol;
-    Doc_GetOffsetInfo(pState->pDoc, pState->cursorOffset, &cursorLine, &cursorCol);
-    
-    // Calculate position relative to the cursor's current line
-    int promptY = ((cursorLine - 1) * pState->lineHeight) - pState->scrollY;
+    int commandSpace = GetCommandSpaceHeight(pState);
+    if (commandSpace <= 0) return;
 
-    // Ensure prompt is within visible bounds before drawing
-    if (promptY >= 0 && promptY < rc.bottom) {
-        RECT promptRect = { 0, promptY, rc.right, promptY + pState->lineHeight };
-        
-        // Draw a solid background for the prompt to ensure legibility
-        HBRUSH hPromptBg = CreateSolidBrush(RGB(240,234,221)); // Light beige background
+    int promptY = GetCommandPromptTopY(pState, memDC, rc);
+    if (promptY == INT_MIN) return;
+
+    int baseX = pState->bWordWrap ? 5 : (5 - pState->scrollX);
+    HBRUSH hPromptBg = CreateSolidBrush(pState->colorBg);
+
+    // Prompt line
+    RECT promptRect = { 0, promptY, rc.right, promptY + pState->lineHeight };
+    if (promptRect.bottom > 0 && promptRect.top < rc.bottom) {
         FillRect(memDC, &promptRect, hPromptBg);
-        DeleteObject(hPromptBg);
 
         WCHAR szFull[260];
         swprintf(szFull, 260, L":%s", pState->szCommandBuf);
-        
+
         SetTextColor(memDC, pState->colorText);
         SetBkMode(memDC, TRANSPARENT);
-        TabbedTextOutW(memDC, 5, promptY, szFull, (int)wcslen(szFull), 0, NULL, 5);
+        TabbedTextOutW(memDC, baseX, promptY, szFull, (int)wcslen(szFull), 0, NULL, baseX);
     }
+
+    // Feedback line directly beneath the prompt
+    if (pState->bCommandFeedback) {
+        int feedbackY = promptY + pState->lineHeight;
+        RECT feedbackRect = { 0, feedbackY, rc.right, feedbackY + pState->lineHeight };
+        if (feedbackRect.bottom > 0 && feedbackRect.top < rc.bottom) {
+            FillRect(memDC, &feedbackRect, hPromptBg);
+
+            TEXTMETRIC tm;
+            GetTextMetrics(memDC, &tm);
+            int indentPx = tm.tmAveCharWidth * 2; // 1-2 space indent
+
+            SetTextColor(memDC, pState->colorDim);
+            SetBkMode(memDC, TRANSPARENT);
+
+            int msgLen = (int)wcslen(pState->szCommandFeedback);
+            if (msgLen > 0) {
+                TextOutW(memDC, baseX + indentPx, feedbackY, pState->szCommandFeedback, msgLen);
+            }
+
+            if (pState->bCommandFeedbackHasCaret) {
+                WCHAR promptBuf[260];
+                swprintf(promptBuf, 260, L":%s", pState->szCommandBuf);
+                int promptLen = (int)wcslen(promptBuf);
+                int caretCol = pState->commandFeedbackCaretCol;
+                if (caretCol < 0) caretCol = 0;
+                if (caretCol > promptLen) caretCol = promptLen;
+                SIZE caretExtent = {0};
+                GetTextExtentPoint32W(memDC, promptBuf, caretCol, &caretExtent);
+                int caretX = baseX + caretExtent.cx;
+                TextOutW(memDC, caretX, feedbackY, L"^", 1);
+            }
+        }
+    }
+
+    DeleteObject(hPromptBg);
 }
 
 static LRESULT HandleCreate(HWND hwnd) {
@@ -834,6 +1027,7 @@ static LRESULT HandleCreate(HWND hwnd) {
     pState->bInsertMode = TRUE;
     pState->caretAlpha = 0.0f;     // Start transparent
     pState->caretDirection = 1;    // Prepare to fade in
+    pState->scrollX = 0;
     
     // 2. Create Font
     pState->hFont = CreateFont(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, 
@@ -936,6 +1130,12 @@ static LRESULT HandleTimer(HWND hwnd, ViewState* pState, WPARAM wParam) {
 // Command resolution (short + long forms)
 // ------------------------------------------------------------
 
+typedef struct {
+    const WCHAR* message; // Static text describing the issue
+    int caretCol;         // 0-based column in the visible prompt (':' is column 0)
+    BOOL showCaret;
+} CommandError;
+
 static ExCommandType ResolveCommand(const WCHAR* cmd)
 {
     if (_wcsicmp(cmd, L"w") == 0 ||
@@ -959,11 +1159,11 @@ static ExCommandType ResolveCommand(const WCHAR* cmd)
 
 // Ex command parser
 // Grammar: : <command> [!] [args]
-static BOOL ParseExCommand(const WCHAR* text, ExCommand* out)
+static BOOL ParseExCommand(WCHAR* text, ExCommand* out)
 {
     ZeroMemory(out, sizeof(*out));
 
-    const WCHAR* p = text;
+    WCHAR* p = text;
 
     // Skip leading whitespace
     while (iswspace(*p))
@@ -998,11 +1198,14 @@ static BOOL ParseExCommand(const WCHAR* text, ExCommand* out)
     {
         if (*p == L'"')
         {
-            // Quoted argument
-            p++;
+            // Quoted argument: strip surrounding quotes in-place
+            p++; // move past opening quote
             out->arg = p;
             while (*p && *p != L'"')
                 p++;
+            if (*p == L'"') {
+                *p = L'\0'; // terminate at closing quote
+            }
         }
         else
         {
@@ -1053,15 +1256,12 @@ static void ExecuteExCommand(HWND hwnd, const ExCommand* cmd)
         case EXCMD_EDIT:
         {
             if (!cmd->arg)
-            {
-                // TODO: report error (edit requires filename)
                 break;
-            }
-
-            SendMessage(GetParent(hwnd),
-                        WM_APP_OPEN_FILE,
-                        0,
-                        (LPARAM)cmd->arg);
+            else
+                SendMessage(GetParent(hwnd),
+                            WM_APP_OPEN_FILE,
+                            0,
+                            (LPARAM)cmd->arg);
             break;
         }
 
@@ -1072,31 +1272,65 @@ static void ExecuteExCommand(HWND hwnd, const ExCommand* cmd)
 
 
 // Entry point: called when user submits a command line
-static void ProcessCommandText(HWND hwnd, const WCHAR* text)
+static BOOL ProcessCommandText(HWND hwnd, WCHAR* text, CommandError* pError)
 {
-    if (!text || !*text)
-        return;
+    if (!text)
+        return FALSE;
 
     // Treat the command buffer as an Ex command; the visible ':' prompt is not stored in the buffer
-    const WCHAR* pCmd = (text[0] == L':') ? text + 1 : text;
+    WCHAR* pCmd = (text[0] == L':') ? text + 1 : text;
+    WCHAR* wordStart = pCmd;
+    while (*wordStart && iswspace(*wordStart)) wordStart++;
+
+    // Blank or whitespace-only command: treat as a no-op so Enter can dismiss cleanly
+    if (!*wordStart)
+        return TRUE;
+
+    int cmdWordLen = 0;
+    while (wordStart[cmdWordLen] && !iswspace(wordStart[cmdWordLen]) && wordStart[cmdWordLen] != L'!')
+        cmdWordLen++;
 
     ExCommand cmd;
     if (!ParseExCommand(pCmd, &cmd))
     {
-        // TODO: report "Not an editor command"
-        return;
+        if (pError) {
+            pError->message = L"unknown command";
+            pError->caretCol = 1 + (int)(wordStart - pCmd);
+            pError->showCaret = TRUE;
+        }
+        return FALSE;
+    }
+
+    if (cmd.type == EXCMD_EDIT && !cmd.arg)
+    {
+        if (pError) {
+            int caretCol = 1 + (int)(wordStart - pCmd) + cmdWordLen + (cmd.force ? 1 : 0);
+            pError->message = L"file name required";
+            pError->caretCol = caretCol;
+            pError->showCaret = TRUE;
+        }
+        return FALSE;
+    }
+
+    if (pError) {
+        pError->message = NULL;
+        pError->showCaret = FALSE;
+        pError->caretCol = 0;
     }
 
     ExecuteExCommand(hwnd, &cmd);
+    return TRUE;
 }
 
 static void ExitCommandMode(HWND hwnd, ViewState* pState) {
+    ClearCommandFeedback(pState);
     pState->bCommandMode = FALSE;
     pState->commandLen = 0;
     pState->commandCaretPos = 0;
     pState->szCommandBuf[0] = L'\0';
 
     InvalidateRect(hwnd, NULL, TRUE);
+    UpdateScrollbars(hwnd, pState);
     UpdateCaretPosition(hwnd, pState);
 }
 
@@ -1109,8 +1343,22 @@ static void SubmitCommand(HWND hwnd, ViewState* pState) {
     }
     commandCopy[copyLen] = L'\0';
 
-    ExitCommandMode(hwnd, pState);
-    ProcessCommandText(hwnd, commandCopy);
+    ClearCommandFeedback(pState);
+
+    CommandError err = {0};
+    BOOL success = ProcessCommandText(hwnd, commandCopy, &err);
+
+    if (success) {
+        ExitCommandMode(hwnd, pState);
+    } else {
+        if (err.message) {
+            int caretCol = (err.caretCol < 0) ? 0 : err.caretCol;
+            SetCommandFeedback(pState, err.message, caretCol, err.showCaret);
+        }
+        UpdateScrollbars(hwnd, pState);
+        InvalidateRect(hwnd, NULL, TRUE);
+        UpdateCaretPosition(hwnd, pState);
+    }
 }
 
 static LRESULT HandleChar(HWND hwnd, ViewState* pState, WPARAM wParam) {
@@ -1136,6 +1384,7 @@ static LRESULT HandleChar(HWND hwnd, ViewState* pState, WPARAM wParam) {
 
         // Append to the command buffer if there is space (leaving room for null terminator)
         if (pState->commandLen < 255) {
+            if (pState->bCommandFeedback) ClearCommandFeedback(pState);
             // If the caret is not at the end, shift text to the right to make room (Insert mode behavior)
             if (pState->commandCaretPos < pState->commandLen) {
                 memmove(&pState->szCommandBuf[pState->commandCaretPos + 1], 
@@ -1257,6 +1506,7 @@ static LRESULT HandleKeyDown(HWND hwnd, ViewState* pState, WPARAM wParam, LPARAM
                 break;
             case VK_BACK:
                 if (pState->commandCaretPos > 0) {
+                    if (pState->bCommandFeedback) ClearCommandFeedback(pState);
                     // Shift buffer left to overwrite the character before the caret
                     memmove(&pState->szCommandBuf[pState->commandCaretPos - 1], 
                             &pState->szCommandBuf[pState->commandCaretPos], 
@@ -1267,6 +1517,7 @@ static LRESULT HandleKeyDown(HWND hwnd, ViewState* pState, WPARAM wParam, LPARAM
                 break;
             case VK_DELETE:
                 if (pState->commandCaretPos < pState->commandLen) {
+                    if (pState->bCommandFeedback) ClearCommandFeedback(pState);
                     // Shift buffer left to overwrite the character at the caret
                     memmove(&pState->szCommandBuf[pState->commandCaretPos], 
                             &pState->szCommandBuf[pState->commandCaretPos + 1], 
@@ -1305,11 +1556,13 @@ static LRESULT HandleKeyDown(HWND hwnd, ViewState* pState, WPARAM wParam, LPARAM
         // Trigger Colon Prompt: CTRL + ;
         case VK_OEM_1: // ';' key
             if (isCtrlPressed) {
+                ClearCommandFeedback(pState);
                 pState->bCommandMode = TRUE;
                 pState->commandLen = 0;      // RESET LENGTH
                 pState->commandCaretPos = 0; // RESET CARET
                 pState->szCommandBuf[0] = L'\0';
                 InvalidateRect(hwnd, NULL, TRUE);
+                UpdateScrollbars(hwnd, pState);
                 return 0;
             }
             break;
@@ -1568,6 +1821,52 @@ static LRESULT HandleVScroll(HWND hwnd, ViewState* pState, WPARAM wParam) {
     return 0;
 }
 
+static LRESULT HandleHScroll(HWND hwnd, ViewState* pState, WPARAM wParam) {
+    if (pState->bWordWrap) return 0; // no horizontal scroll when wrapping
+
+    SCROLLINFO si = { sizeof(si), SIF_ALL };
+    GetScrollInfo(hwnd, SB_HORZ, &si);
+
+    int oldX = pState->scrollX;
+    int newX = oldX;
+
+    RECT rc;
+    GetClientRect(hwnd, &rc);
+    int clientWidth = rc.right;
+    int docWidth = View_GetDocumentWidth(hwnd, pState);
+    int maxScroll = docWidth - clientWidth;
+    if (maxScroll < 0) maxScroll = 0;
+
+    HDC hdc = GetDC(hwnd);
+    SelectObject(hdc, pState->hFont);
+    TEXTMETRIC tm;
+    GetTextMetrics(hdc, &tm);
+    int charWidth = tm.tmAveCharWidth;
+    ReleaseDC(hwnd, hdc);
+
+    switch (LOWORD(wParam)) {
+        case SB_LEFT:      newX = 0; break;
+        case SB_RIGHT:     newX = maxScroll; break;
+        case SB_LINELEFT:  newX -= charWidth; break;
+        case SB_LINERIGHT: newX += charWidth; break;
+        case SB_PAGELEFT:  newX -= clientWidth; break;
+        case SB_PAGERIGHT: newX += clientWidth; break;
+        case SB_THUMBTRACK:newX = si.nTrackPos; break;
+        default: break;
+    }
+
+    if (newX < 0) newX = 0;
+    if (newX > maxScroll) newX = maxScroll;
+
+    if (newX != oldX) {
+        pState->scrollX = newX;
+        SetScrollPos(hwnd, SB_HORZ, pState->scrollX, TRUE);
+        UpdateCaretPosition(hwnd, pState);
+        InvalidateRect(hwnd, NULL, TRUE);
+    }
+    return 0;
+}
+
 static LRESULT HandleSize(HWND hwnd, ViewState* pState, WPARAM wParam, LPARAM lParam) {
     (void)wParam;
     if (pState && pState->pDoc) {
@@ -1616,14 +1915,14 @@ static LRESULT HandleLButtonDown(HWND hwnd, ViewState* pState, WPARAM wParam, LP
     SetFocus(hwnd);
 
     ResetCaretBlink(pState);
-    // Dismiss command mode if active
-    if (pState->bCommandMode) {
-            pState->bCommandMode = FALSE;
-            InvalidateRect(hwnd, NULL, TRUE);
-    }
 
     // Convert click coordinates to a logical document offset
     size_t offset = GetOffsetFromPoint(hwnd, pState, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+    
+    // Dismiss command mode if active (after capturing position for accurate mapping)
+    if (pState->bCommandMode) {
+            ExitCommandMode(hwnd, pState);
+    }
     
     // Handle selection extension vs. simple cursor move
     if (GetKeyState(VK_SHIFT) & 0x8000) {
@@ -1667,6 +1966,7 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
         case WM_PAINT:       return HandlePaint(hwnd, pState);
         case WM_MOUSEMOVE:   return HandleMouseMove(hwnd, pState, wParam, lParam);
         case WM_LBUTTONUP:   return HandleLButtonUp(hwnd, pState);
+        case WM_HSCROLL:     return HandleHScroll(hwnd, pState, wParam);
         case WM_VSCROLL:     return HandleVScroll(hwnd, pState, wParam);
         case WM_SIZE:        return HandleSize(hwnd, pState, wParam, lParam);
         case WM_SETFOCUS:    return HandleSetFocus(hwnd, pState);
