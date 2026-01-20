@@ -12,6 +12,9 @@
 *.map
 *.exp
 
+# Compiled Resource files]
+*.res
+
 # Precompiled Headers
 *.gch
 *.pch
@@ -53,3 +56,6 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# Visual Studio Code files
+.vs/

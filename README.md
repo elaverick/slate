@@ -1,7 +1,7 @@
 [![Build and Release (Win32)](https://github.com/elaverick/slate/actions/workflows/build-and-release.yml/badge.svg)](https://github.com/elaverick/slate/actions/workflows/build-and-release.yml) ![GitHub Release](https://img.shields.io/github/v/release/elaverick/slate)
 
 
-# Notepad Clone
+# Slate
 
 A calm, liminal tool for text — built for large files, quiet focus, and the spaces in between.
 
