@@ -532,3 +532,240 @@ void Doc_GetOffsetInfo(SlateDoc* doc, size_t offset, int* out_line, int* out_col
     *out_line = line;
     *out_col = (int)(offset - doc->line_offsets[line - 1]) + 1;
 }
+
+// ------------------------------
+// Rabin–Karp search
+// ------------------------------
+
+typedef struct {
+    Piece* piece;
+    size_t pieceOffset;
+    size_t logicalOffset;
+} DocCharIterator;
+
+static WCHAR FoldAscii(WCHAR ch, BOOL caseSensitive) {
+    if (caseSensitive) return ch;
+    if (ch >= L'A' && ch <= L'Z') return ch + 32;
+    return ch;
+}
+
+static BOOL DocIter_Seek(SlateDoc* doc, size_t targetOffset, DocCharIterator* it) {
+    if (!doc || !it) return FALSE;
+
+    size_t cumulative = 0;
+    Piece* curr = doc->head;
+    while (curr && (cumulative + curr->length) <= targetOffset) {
+        cumulative += curr->length;
+        curr = curr->next;
+    }
+
+    it->piece = curr;
+    it->pieceOffset = curr ? (targetOffset - cumulative) : 0;
+    it->logicalOffset = targetOffset;
+    return TRUE;
+}
+
+static WCHAR Doc_ReadChar(const SlateDoc* doc, const Piece* piece, size_t pieceOffset) {
+    if (!doc || !piece) return 0;
+
+    if (piece->buffer == BUFFER_ORIGINAL && piece->isUtf8) {
+        const unsigned char* buf = (const unsigned char*)doc->original_buffer;
+        return (WCHAR)buf[piece->start + pieceOffset];
+    }
+
+    const WCHAR* buf = (piece->buffer == BUFFER_ORIGINAL) ? (WCHAR*)doc->original_buffer : doc->add_buffer;
+    return buf ? buf[piece->start + pieceOffset] : 0;
+}
+
+static BOOL DocIter_Next(SlateDoc* doc, DocCharIterator* it, WCHAR* outChar) {
+    if (!doc || !it || !it->piece) return FALSE;
+
+    *outChar = Doc_ReadChar(doc, it->piece, it->pieceOffset);
+
+    // Advance iterator
+    it->logicalOffset++;
+    it->pieceOffset++;
+    if (it->pieceOffset >= it->piece->length) {
+        it->piece = it->piece->next;
+        it->pieceOffset = 0;
+    }
+    return TRUE;
+}
+
+static BOOL WindowEquals(const WCHAR* windowBuf, size_t startIdx, const WCHAR* pattern, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        if (windowBuf[(startIdx + i) % len] != pattern[i]) return FALSE;
+    }
+    return TRUE;
+}
+
+DocSearchResult Doc_Search(SlateDoc* doc, const WCHAR* pattern, size_t patternLen, size_t cursorOffset, BOOL searchBackwards, BOOL caseSensitive) {
+    DocSearchResult result = {0};
+    result.status = DOC_SEARCH_NO_PATTERN;
+    result.match_length = patternLen;
+    result.line = 1;
+    result.column = 1;
+
+    if (!doc || !pattern || patternLen == 0) {
+        return result; // No-op for empty pattern or null inputs
+    }
+
+    size_t docLen = doc->total_length;
+    if (docLen == 0 || patternLen > docLen) {
+        result.status = searchBackwards ? DOC_SEARCH_REACHED_BOF : DOC_SEARCH_REACHED_EOF;
+        return result;
+    }
+
+    if (cursorOffset > docLen) cursorOffset = docLen;
+
+    WCHAR* patternNorm = (WCHAR*)malloc(patternLen * sizeof(WCHAR));
+    if (!patternNorm) {
+        result.status = searchBackwards ? DOC_SEARCH_REACHED_BOF : DOC_SEARCH_REACHED_EOF;
+        return result;
+    }
+
+    const unsigned int base = 257;
+    const unsigned int mod  = 1000000007;
+    unsigned long long patternHash = 0;
+    unsigned long long windowHash = 0;
+    unsigned long long highestPow = 1; // base^(patternLen-1)
+
+    for (size_t i = 0; i < patternLen; i++) {
+        patternNorm[i] = FoldAscii(pattern[i], caseSensitive);
+        patternHash = (patternHash * base + patternNorm[i]) % mod;
+        if (i < patternLen - 1) {
+            highestPow = (highestPow * base) % mod;
+        }
+    }
+
+    if (!searchBackwards) {
+        // Forward search from cursorOffset to EOF
+        if (cursorOffset + patternLen > docLen) {
+            free(patternNorm);
+            result.status = DOC_SEARCH_REACHED_EOF;
+            return result;
+        }
+
+        DocCharIterator it;
+        DocIter_Seek(doc, cursorOffset, &it);
+
+        WCHAR* window = (WCHAR*)malloc(patternLen * sizeof(WCHAR));
+        if (!window) {
+            free(patternNorm);
+            result.status = DOC_SEARCH_REACHED_EOF;
+            return result;
+        }
+
+        // Prime the first window
+        for (size_t i = 0; i < patternLen; i++) {
+            WCHAR ch;
+            if (!DocIter_Next(doc, &it, &ch)) {
+                free(window);
+                free(patternNorm);
+                result.status = DOC_SEARCH_REACHED_EOF;
+                return result;
+            }
+            window[i] = FoldAscii(ch, caseSensitive);
+            windowHash = (windowHash * base + window[i]) % mod;
+        }
+
+        size_t windowStartIdx = 0;
+        size_t currentStart = cursorOffset;
+        size_t lastStart = docLen - patternLen;
+
+        while (1) {
+            if (windowHash == patternHash && WindowEquals(window, windowStartIdx, patternNorm, patternLen)) {
+                result.status = DOC_SEARCH_MATCH;
+                result.match_offset = currentStart;
+                Doc_GetOffsetInfo(doc, currentStart, &result.line, &result.column);
+                free(window);
+                free(patternNorm);
+                return result;
+            }
+
+            if (currentStart >= lastStart) break;
+
+            WCHAR nextChar;
+            if (!DocIter_Next(doc, &it, &nextChar)) break;
+            WCHAR foldedNext = FoldAscii(nextChar, caseSensitive);
+
+            WCHAR outgoing = window[windowStartIdx];
+            windowStartIdx = (windowStartIdx + 1) % patternLen;
+            size_t insertIdx = (windowStartIdx + patternLen - 1) % patternLen;
+            window[insertIdx] = foldedNext;
+
+            // Rolling hash: remove outgoing, add incoming
+            unsigned long long temp = (windowHash + mod - (outgoing * highestPow) % mod) % mod;
+            windowHash = (temp * base + foldedNext) % mod;
+
+            currentStart++;
+        }
+
+        free(window);
+        result.status = DOC_SEARCH_REACHED_EOF;
+    } else {
+        // Backward search: scan from start, keep the last match <= cursorOffset
+        size_t lastAllowedStart = (cursorOffset + patternLen > docLen) ? (docLen - patternLen) : cursorOffset;
+
+        DocCharIterator it;
+        DocIter_Seek(doc, 0, &it);
+
+        WCHAR* window = (WCHAR*)malloc(patternLen * sizeof(WCHAR));
+        if (!window) {
+            free(patternNorm);
+            result.status = DOC_SEARCH_REACHED_BOF;
+            return result;
+        }
+
+        for (size_t i = 0; i < patternLen; i++) {
+            WCHAR ch;
+            if (!DocIter_Next(doc, &it, &ch)) {
+                free(window);
+                free(patternNorm);
+                result.status = DOC_SEARCH_REACHED_BOF;
+                return result;
+            }
+            window[i] = FoldAscii(ch, caseSensitive);
+            windowHash = (windowHash * base + window[i]) % mod;
+        }
+
+        size_t windowStartIdx = 0;
+        size_t currentStart = 0;
+        size_t bestMatch = (size_t)-1;
+
+        while (currentStart <= lastAllowedStart) {
+            if (windowHash == patternHash && WindowEquals(window, windowStartIdx, patternNorm, patternLen)) {
+                bestMatch = currentStart;
+            }
+
+            if (currentStart == lastAllowedStart) break;
+
+            WCHAR nextChar;
+            if (!DocIter_Next(doc, &it, &nextChar)) break;
+            WCHAR foldedNext = FoldAscii(nextChar, caseSensitive);
+
+            WCHAR outgoing = window[windowStartIdx];
+            windowStartIdx = (windowStartIdx + 1) % patternLen;
+            size_t insertIdx = (windowStartIdx + patternLen - 1) % patternLen;
+            window[insertIdx] = foldedNext;
+
+            unsigned long long temp = (windowHash + mod - (outgoing * highestPow) % mod) % mod;
+            windowHash = (temp * base + foldedNext) % mod;
+
+            currentStart++;
+        }
+
+        free(window);
+
+        if (bestMatch != (size_t)-1) {
+            result.status = DOC_SEARCH_MATCH;
+            result.match_offset = bestMatch;
+            Doc_GetOffsetInfo(doc, bestMatch, &result.line, &result.column);
+        } else {
+            result.status = DOC_SEARCH_REACHED_BOF;
+        }
+    }
+
+    free(patternNorm);
+    return result;
+}

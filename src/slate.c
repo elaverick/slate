@@ -11,6 +11,116 @@
 // Global application state
 SLATE_APP g_app = {0};
 
+typedef struct {
+    WCHAR pattern[256];
+    BOOL matchCase;
+    BOOL backwards;
+    BOOL hasLast;
+    size_t lastOffset;
+    size_t lastLength;
+} FIND_STATE;
+
+static FIND_STATE g_findState = { L"", FALSE, FALSE, FALSE, 0, 0 };
+
+static void ShowSearchStatusMessage(HWND hwndOwner, DocSearchStatus status) {
+    const WCHAR* msg = NULL;
+    switch (status) {
+        case DOC_SEARCH_NO_PATTERN: msg = L"Enter text to search for."; break;
+        case DOC_SEARCH_REACHED_EOF: msg = L"Reached end of file without a match."; break;
+        case DOC_SEARCH_REACHED_BOF: msg = L"Reached beginning of file without a match."; break;
+        default: break;
+    }
+    if (msg) {
+        MessageBoxW(hwndOwner, msg, L"Find", MB_OK | MB_ICONINFORMATION);
+    }
+}
+
+static size_t ComputeSearchStartOffset(BOOL backwards) {
+    size_t startOffset = View_GetCursorOffset(g_app.hEdit);
+    if (g_findState.hasLast && g_findState.backwards == backwards) {
+        if (!backwards) {
+            startOffset = g_findState.lastOffset + 1;
+        } else {
+            startOffset = (g_findState.lastOffset > 0) ? g_findState.lastOffset - 1 : 0;
+        }
+    }
+    if (g_app.pDoc && startOffset > g_app.pDoc->total_length) {
+        startOffset = g_app.pDoc->total_length;
+    }
+    return startOffset;
+}
+
+static void RunFind(HWND hDlg) {
+    WCHAR buf[256] = {0};
+    GetDlgItemTextW(hDlg, IDC_FIND_TEXT, buf, _countof(buf));
+    size_t len = wcslen(buf);
+    if (len == 0) {
+        ShowSearchStatusMessage(hDlg, DOC_SEARCH_NO_PATTERN);
+        return;
+    }
+
+    if (!g_app.pDoc) {
+        MessageBoxW(hDlg, L"No document is open.", L"Find", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+
+    BOOL backwards = (IsDlgButtonChecked(hDlg, IDC_FIND_BACKWARD) == BST_CHECKED);
+    BOOL matchCase = (IsDlgButtonChecked(hDlg, IDC_FIND_MATCHCASE) == BST_CHECKED);
+
+    BOOL patternChanged = (wcscmp(g_findState.pattern, buf) != 0) || (g_findState.matchCase != matchCase) || (g_findState.backwards != backwards);
+    if (patternChanged) {
+        g_findState.hasLast = FALSE;
+    }
+
+    // Save the current query settings
+    wcsncpy(g_findState.pattern, buf, _countof(g_findState.pattern) - 1);
+    g_findState.pattern[_countof(g_findState.pattern) - 1] = L'\0';
+    g_findState.matchCase = matchCase;
+    g_findState.backwards = backwards;
+
+    size_t startOffset = ComputeSearchStartOffset(backwards);
+    DocSearchResult res = Doc_Search(g_app.pDoc, buf, len, startOffset, backwards, matchCase);
+
+    if (res.status == DOC_SEARCH_MATCH) {
+        g_findState.hasLast = TRUE;
+        g_findState.lastOffset = res.match_offset;
+        g_findState.lastLength = res.match_length;
+        View_ApplySearchResult(g_app.hEdit, &res);
+    } else {
+        g_findState.hasLast = FALSE;
+        ShowSearchStatusMessage(hDlg, res.status);
+    }
+}
+
+static INT_PTR CALLBACK FindDlgProc(HWND hDlg, UINT message, WPARAM wParam, LPARAM lParam) {
+    UNREFERENCED_PARAMETER(lParam);
+    switch (message) {
+        case WM_INITDIALOG: {
+            SetDlgItemTextW(hDlg, IDC_FIND_TEXT, g_findState.pattern);
+            CheckDlgButton(hDlg, g_findState.backwards ? IDC_FIND_BACKWARD : IDC_FIND_FORWARD, BST_CHECKED);
+            CheckDlgButton(hDlg, IDC_FIND_MATCHCASE, g_findState.matchCase ? BST_CHECKED : BST_UNCHECKED);
+            HWND hEdit = GetDlgItem(hDlg, IDC_FIND_TEXT);
+            SendMessage(hEdit, EM_SETSEL, 0, -1);
+            SetFocus(hEdit);
+            return FALSE;
+        }
+        case WM_COMMAND: {
+            switch (LOWORD(wParam)) {
+                case IDC_FIND_NEXT:
+                case IDOK:
+                    RunFind(hDlg);
+                    return TRUE;
+                case IDC_FIND_CANCEL:
+                case IDCANCEL:
+                    EndDialog(hDlg, IDCANCEL);
+                    return TRUE;
+            }
+            break;
+        }
+    }
+    return FALSE;
+}
+
 /**
  * Creates the menu bar for the application
  */
@@ -36,6 +146,8 @@ HMENU CreateMenuBar(void) {
     AppendMenu(hEditMenu, MF_STRING, ID_EDIT_COPY, _T("&Copy\tCtrl+C"));
     AppendMenu(hEditMenu, MF_STRING, ID_EDIT_PASTE, _T("&Paste\tCtrl+V"));
     AppendMenu(hEditMenu, MF_STRING, ID_EDIT_DELETE, _T("De&lete\tDel"));
+    AppendMenu(hEditMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenu(hEditMenu, MF_STRING, ID_EDIT_FIND, _T("&Find...\tCtrl+F"));
     AppendMenu(hEditMenu, MF_SEPARATOR, 0, NULL);
     AppendMenu(hEditMenu, MF_STRING, ID_EDIT_SELECT_ALL, _T("Select &All\tCtrl+A"));
     AppendMenu(hMenuBar, MF_POPUP, (UINT_PTR)hEditMenu, _T("&Edit"));
@@ -387,6 +499,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
 
                 case ID_EDIT_SELECT_ALL:
                     View_SelectAll(g_app.hEdit);
+                    break;
+
+                case ID_EDIT_FIND:
+                    DialogBox(GetModuleHandle(NULL), MAKEINTRESOURCE(IDD_FIND_DIALOG), hwnd, FindDlgProc);
                     break;
 
                 case ID_EDIT_CUT:

@@ -794,6 +794,27 @@ void UpdateCaretPosition(HWND hwnd, ViewState* pState) {
     SetCaretPos(x, y);
 }
 
+BOOL View_ApplySearchResult(HWND hwnd, const DocSearchResult* result) {
+    ViewState* pState = GetState(hwnd);
+    if (!pState || !pState->pDoc || !result) return FALSE;
+    if (result->status != DOC_SEARCH_MATCH) return FALSE;
+
+    size_t start = result->match_offset;
+    size_t end = start + result->match_length;
+
+    if (start > pState->pDoc->total_length) return FALSE;
+    if (end > pState->pDoc->total_length) end = pState->pDoc->total_length;
+
+    pState->selectionAnchor = start;
+    pState->cursorOffset = end;
+
+    NotifyParent(hwnd, EN_SELCHANGE);
+    EnsureCursorVisible(hwnd, pState);
+    UpdateCaretPosition(hwnd, pState);
+    InvalidateRect(hwnd, NULL, TRUE);
+    return TRUE;
+}
+
 static void PaintWrappedContent(ViewState* pState, HDC memDC, RECT rc, int tabStops, COLORREF currentDim) {
     int currentY = -pState->scrollY;
     RECT textRect = rc;

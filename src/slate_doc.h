@@ -57,4 +57,21 @@ BOOL      Doc_Delete(SlateDoc* doc, size_t offset, size_t len);
 BOOL      Doc_Undo(SlateDoc* pDoc, size_t* outCursor);
 BOOL      Doc_Redo(SlateDoc* pDoc, size_t* outCursor);
 
+typedef enum {
+    DOC_SEARCH_NO_PATTERN,
+    DOC_SEARCH_MATCH,
+    DOC_SEARCH_REACHED_EOF,
+    DOC_SEARCH_REACHED_BOF
+} DocSearchStatus;
+
+typedef struct {
+    DocSearchStatus status;
+    size_t match_offset;
+    size_t match_length;
+    int line;
+    int column;
+} DocSearchResult;
+
+DocSearchResult Doc_Search(SlateDoc* doc, const WCHAR* pattern, size_t patternLen, size_t cursorOffset, BOOL searchBackwards, BOOL caseSensitive);
+
 #endif

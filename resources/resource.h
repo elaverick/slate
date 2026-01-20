@@ -3,5 +3,12 @@
 
 // Resource identifiers
 #define IDI_APP_ICON 101
+#define IDD_FIND_DIALOG 102
+#define IDC_FIND_TEXT 1001
+#define IDC_FIND_FORWARD 1002
+#define IDC_FIND_BACKWARD 1003
+#define IDC_FIND_MATCHCASE 1004
+#define IDC_FIND_NEXT 1005
+#define IDC_FIND_CANCEL 1006
 
 #endif // SLATE_RESOURCE_H

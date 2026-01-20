@@ -19,6 +19,7 @@
 #define ID_EDIT_PASTE        2005
 #define ID_EDIT_DELETE       2006
 #define ID_EDIT_SELECT_ALL   2007
+#define ID_EDIT_FIND         2008
 
 #define ID_VIEW_WORDWRAP     3001
 #define ID_VIEW_NONPRINTABLE 3002

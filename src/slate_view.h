@@ -72,6 +72,7 @@ void View_SetShowNonPrintable(HWND hwnd, BOOL bShow);
 void View_SetDefaultColors(HWND hwnd);
 void View_UseSystemColors(HWND hwnd);
 void View_SetInsertMode(HWND hwnd, BOOL bInsert);
+BOOL View_ApplySearchResult(HWND hwnd, const DocSearchResult* result);
 
 BOOL View_GetShowNonPrintable(HWND hwnd);
 BOOL View_IsInsertMode(HWND hwnd);
