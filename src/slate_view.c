@@ -1174,6 +1174,10 @@ static ExCommandType ResolveCommand(const WCHAR* cmd)
         _wcsicmp(cmd, L"edit") == 0)
         return EXCMD_EDIT;
 
+    if (_wcsicmp(cmd, L"s") == 0 ||
+        _wcsicmp(cmd, L"search") == 0)
+        return EXCMD_SEARCH;
+
     return EXCMD_NONE;
 }
 
@@ -1203,6 +1207,10 @@ static BOOL ParseExCommand(WCHAR* text, ExCommand* out)
     if (out->type == EXCMD_NONE)
         return FALSE;
 
+    out->searchBackwards = FALSE;
+    out->searchCaseSensitive = FALSE;
+    out->arg = NULL;
+
     // Optional force modifier
     if (*p == L'!')
     {
@@ -1215,22 +1223,59 @@ static BOOL ParseExCommand(WCHAR* text, ExCommand* out)
         p++;
 
     // Optional argument (filename, possibly quoted)
-    if (*p)
-    {
-        if (*p == L'"')
-        {
-            // Quoted argument: strip surrounding quotes in-place
-            p++; // move past opening quote
-            out->arg = p;
-            while (*p && *p != L'"')
-                p++;
+    if (*p) {
+        if (out->type == EXCMD_SEARCH) {
+            // Pattern parsing (quoted or single token), then optional direction token
             if (*p == L'"') {
-                *p = L'\0'; // terminate at closing quote
+                p++; // move past opening quote
+                out->arg = p;
+                while (*p && *p != L'"') p++;
+                if (*p == L'"') {
+                    *p = L'\0';
+                    p++; // move past closing quote for direction parsing
+                }
+            } else {
+                out->arg = p;
+                while (*p && !iswspace(*p)) p++;
+                if (*p) {
+                    *p = L'\0';
+                    p++;
+                }
             }
-        }
-        else
-        {
-            out->arg = p;
+
+            // Skip whitespace before optional direction
+            while (iswspace(*p)) p++;
+            if (*p) {
+                const WCHAR* dir = p;
+                while (*p && !iswspace(*p)) p++;
+                // No need to null-terminate; compare length-limited
+                if (_wcsnicmp(dir, L"backward", 8) == 0 || _wcsnicmp(dir, L"b", 1) == 0) {
+                    out->searchBackwards = TRUE;
+                } else if (_wcsnicmp(dir, L"forward", 7) == 0 || _wcsnicmp(dir, L"f", 1) == 0) {
+                    out->searchBackwards = FALSE;
+                }
+            }
+
+            // Case sensitivity: uppercase command implies case-sensitive
+            if (wcscmp(cmd, L"S") == 0 || wcscmp(cmd, L"SEARCH") == 0) {
+                out->searchCaseSensitive = TRUE;
+            }
+        } else {
+            if (*p == L'"')
+            {
+                // Quoted argument: strip surrounding quotes in-place
+                p++; // move past opening quote
+                out->arg = p;
+                while (*p && *p != L'"')
+                    p++;
+                if (*p == L'"') {
+                    *p = L'\0'; // terminate at closing quote
+                }
+            }
+            else
+            {
+                out->arg = p;
+            }
         }
     }
 
@@ -1240,6 +1285,32 @@ static BOOL ParseExCommand(WCHAR* text, ExCommand* out)
 // Ex command execution
 static void ExecuteExCommand(HWND hwnd, const ExCommand* cmd)
 {
+    if (cmd->type == EXCMD_SEARCH) {
+        ViewState* pState = GetState(hwnd);
+        if (!pState || !pState->pDoc) {
+            MessageBoxW(hwnd, L"No document is open.", L"Find", MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+
+        if (!cmd->arg || wcslen(cmd->arg) == 0) {
+            MessageBoxW(hwnd, L"Enter text to search for.", L"Find", MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+
+        size_t startOffset = pState->cursorOffset;
+        DocSearchResult res = Doc_Search(pState->pDoc, cmd->arg, wcslen(cmd->arg), startOffset, cmd->searchBackwards, cmd->searchCaseSensitive);
+        if (res.status == DOC_SEARCH_MATCH) {
+            View_ApplySearchResult(hwnd, &res);
+        } else {
+            const WCHAR* msg = NULL;
+            if (res.status == DOC_SEARCH_REACHED_EOF) msg = L"Reached end of file without a match.";
+            else if (res.status == DOC_SEARCH_REACHED_BOF) msg = L"Reached beginning of file without a match.";
+            else msg = L"Pattern not found.";
+            MessageBoxW(hwnd, msg, L"Find", MB_OK | MB_ICONINFORMATION);
+        }
+        return;
+    }
+
     switch (cmd->type)
     {
         case EXCMD_WRITE:

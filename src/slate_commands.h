@@ -49,14 +49,17 @@ typedef enum
     EXCMD_WRITE,
     EXCMD_WRITE_QUIT,
     EXCMD_QUIT,
-    EXCMD_EDIT
+    EXCMD_EDIT,
+    EXCMD_SEARCH
 } ExCommandType;
 
 typedef struct
 {
     ExCommandType type;
     BOOL          force;
-    const WCHAR*  arg;   // filename or NULL
+    const WCHAR*  arg;   // filename for edit/write OR pattern for search
+    BOOL          searchBackwards;
+    BOOL          searchCaseSensitive;
 } ExCommand;
 
 #endif
