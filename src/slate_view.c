@@ -404,6 +404,13 @@ void UpdateScrollbars(HWND hwnd, ViewState* pState) {
     GetClientRect(hwnd, &rc);
     int clientHeight = rc.bottom;
     int wrapWidth = rc.right - 10;
+
+    // Grow the line map just enough to cover the current viewport plus a margin,
+    // instead of forcing a full-file scan on load.
+    int visibleLines = (pState->lineHeight > 0) ? (clientHeight / pState->lineHeight) : 0;
+    size_t targetLine = (size_t)(pState->scrollY / pState->lineHeight) + visibleLines + 200;
+    Doc_GetLineOffset(pState->pDoc, targetLine);
+
     int totalHeight = View_GetDocumentHeight(hwnd, pState, wrapWidth);
 
     SCROLLINFO si = {0};
@@ -475,10 +482,6 @@ void View_SetDocument(HWND hwnd, SlateDoc* pDoc) {
         pState->cursorOffset = 0;
         pState->scrollY = 0;
         pState->scrollX = 0;
-        
-        if (pDoc) {
-            Doc_UpdateLineMap(pDoc); 
-        }
         
         // Reclaim caret and focus
         if (GetFocus() == hwnd) {

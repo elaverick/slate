@@ -2,6 +2,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define LINE_MAP_GROW_STEP 1024
+#define LINE_SCAN_STEP_BYTES (64 * 1024)
+
 static Piece* CreatePiece(BufferType buffer, size_t start, size_t length, BOOL isUtf8) {
     Piece* p = (Piece*)malloc(sizeof(Piece));
     if (p) {
@@ -43,50 +46,127 @@ static Piece* SplitPiece(SlateDoc* doc, size_t offset) {
     return NULL;
 }
 
-void Doc_RefreshMetadata(SlateDoc* pDoc) {
-    pDoc->total_length = 0;
-    pDoc->line_count = 0;
-    
-    if (pDoc->line_offsets == NULL) {
-        pDoc->line_capacity = 1024;
-        pDoc->line_offsets = malloc(pDoc->line_capacity * sizeof(size_t));
-    }
-    pDoc->line_offsets[pDoc->line_count++] = 0;
+static BOOL Doc_GrowLineOffsets(SlateDoc* doc, size_t minExtra) {
+    size_t needed = doc->line_count + minExtra;
+    if (needed < doc->line_capacity) return TRUE;
 
-    Piece* curr = pDoc->head;
-    size_t logicalOffset = 0;
+    size_t newCap = doc->line_capacity;
+    while (newCap <= needed) newCap += LINE_MAP_GROW_STEP;
 
-    while (curr) {
-        if (curr->buffer == BUFFER_ORIGINAL && curr->isUtf8) {
-            // UTF-8 Scan
-            const char* buf = (const char*)pDoc->original_buffer;
-            for (size_t i = 0; i < curr->length; i++) {
-                if (buf[curr->start + i] == '\n') {
-                    if (pDoc->line_count >= pDoc->line_capacity) {
-                        pDoc->line_capacity *= 2;
-                        pDoc->line_offsets = realloc(pDoc->line_offsets, pDoc->line_capacity * sizeof(size_t));
-                    }
-                    pDoc->line_offsets[pDoc->line_count++] = logicalOffset + i + 1;
-                }
-            }
-        } else {
-            // UTF-16 Scan
-            const WCHAR* buf = (curr->buffer == BUFFER_ORIGINAL) ? 
-                               (WCHAR*)pDoc->original_buffer : pDoc->add_buffer;
-            for (size_t i = 0; i < curr->length; i++) {
-                if (buf[curr->start + i] == L'\n') {
-                    if (pDoc->line_count >= pDoc->line_capacity) {
-                        pDoc->line_capacity *= 2;
-                        pDoc->line_offsets = realloc(pDoc->line_offsets, pDoc->line_capacity * sizeof(size_t));
-                    }
-                    pDoc->line_offsets[pDoc->line_count++] = logicalOffset + i + 1;
-                }
-            }
+    size_t* newOffsets = realloc(doc->line_offsets, newCap * sizeof(size_t));
+    if (!newOffsets) return FALSE;
+    doc->line_offsets = newOffsets;
+    doc->line_capacity = newCap;
+    return TRUE;
+}
+
+static void Doc_EnsureLineMapUpTo(SlateDoc* doc, size_t targetOffset) {
+    if (!doc || doc->line_map_complete || !doc->head || targetOffset == 0) return;
+
+    if (targetOffset > doc->total_length) targetOffset = doc->total_length;
+
+    Piece* piece = doc->line_scan_piece;
+    size_t pieceOff = doc->line_scan_piece_offset;
+    size_t logical = doc->line_scan_offset;
+
+    while (piece && logical <= targetOffset) {
+        if (pieceOff >= piece->length) {
+            piece = piece->next;
+            pieceOff = 0;
+            continue;
         }
-        logicalOffset += curr->length;
-        curr = curr->next;
+
+        if (piece->buffer == BUFFER_ORIGINAL && piece->isUtf8) {
+            const char* buf = (const char*)doc->original_buffer;
+            size_t idx = pieceOff;
+            while (idx < piece->length && logical <= targetOffset) {
+                if (buf[piece->start + idx] == '\n') {
+                    if (!Doc_GrowLineOffsets(doc, 1)) break;
+                    doc->line_offsets[doc->line_count++] = logical + 1;
+                }
+                idx++;
+                logical++;
+            }
+            pieceOff = idx;
+        } else {
+            const WCHAR* buf = (piece->buffer == BUFFER_ORIGINAL) ? 
+                               (WCHAR*)doc->original_buffer : doc->add_buffer;
+            size_t idx = pieceOff;
+            while (idx < piece->length && logical <= targetOffset) {
+                if (buf && buf[piece->start + idx] == L'\n') {
+                    if (!Doc_GrowLineOffsets(doc, 1)) break;
+                    doc->line_offsets[doc->line_count++] = logical + 1;
+                }
+                idx++;
+                logical++;
+            }
+            pieceOff = idx;
+        }
+
+        if (pieceOff >= piece->length) {
+            piece = piece->next;
+            pieceOff = 0;
+        }
     }
-    pDoc->total_length = logicalOffset;
+
+    doc->line_scan_piece = piece;
+    doc->line_scan_piece_offset = pieceOff;
+    doc->line_scan_offset = logical;
+
+    if (!piece || logical >= doc->total_length) {
+        doc->line_map_complete = TRUE;
+        if (Doc_GrowLineOffsets(doc, 1)) {
+            doc->line_offsets[doc->line_count] = doc->total_length;
+        }
+    }
+}
+
+static void Doc_EnsureLineForIndex(SlateDoc* doc, size_t lineIndex) {
+    if (!doc) return;
+
+    while (!doc->line_map_complete && doc->line_count <= lineIndex) {
+        size_t nextTarget = doc->line_scan_offset + LINE_SCAN_STEP_BYTES;
+        if (nextTarget > doc->total_length) nextTarget = doc->total_length;
+        Doc_EnsureLineMapUpTo(doc, nextTarget);
+        if (doc->line_scan_offset == nextTarget) break; // Avoid infinite loop on allocation failure
+    }
+}
+
+void Doc_RefreshMetadata(SlateDoc* pDoc) {
+    if (!pDoc) return;
+
+    // Recompute total length without scanning characters
+    size_t totalLen = 0;
+    for (Piece* curr = pDoc->head; curr; curr = curr->next) {
+        totalLen += curr->length;
+    }
+    pDoc->total_length = totalLen;
+
+    // Reset line map storage
+    if (pDoc->line_offsets) {
+        free(pDoc->line_offsets);
+    }
+    pDoc->line_capacity = LINE_MAP_GROW_STEP;
+    pDoc->line_offsets = malloc(pDoc->line_capacity * sizeof(size_t));
+    if (!pDoc->line_offsets) {
+        pDoc->line_count = 0;
+        pDoc->line_map_complete = TRUE;
+        pDoc->line_scan_offset = 0;
+        pDoc->line_scan_piece = NULL;
+        pDoc->line_scan_piece_offset = 0;
+        return;
+    }
+
+    pDoc->line_offsets[0] = 0;
+    pDoc->line_count = 1;
+    pDoc->line_map_complete = (totalLen == 0);
+    pDoc->line_scan_offset = 0;
+    pDoc->line_scan_piece = pDoc->head;
+    pDoc->line_scan_piece_offset = 0;
+
+    if (pDoc->line_map_complete && pDoc->line_capacity > 1) {
+        pDoc->line_offsets[1] = 0;
+    }
 }
 
 Piece* ClonePieceList(Piece* head) {
@@ -116,64 +196,6 @@ void FreePieceList(Piece* head) {
         free(head);
         head = next;
     }
-}
-
-void Doc_UpdateLineMap(SlateDoc* doc) {
-    if (!doc) return;
-
-    // Reset line map storage
-    if (doc->line_offsets) {
-        free(doc->line_offsets);
-    }
-    doc->line_count = 0;
-    doc->line_capacity = 1024;
-    doc->line_offsets = (size_t*)malloc(doc->line_capacity * sizeof(size_t));
-    if (!doc->line_offsets) return;
-
-    doc->line_offsets[doc->line_count++] = 0; 
-
-    Piece* curr = doc->head;
-    size_t logical_base = 0;
-
-    while (curr) {
-        if (curr->buffer == BUFFER_ORIGINAL && curr->isUtf8) {
-            // Scan UTF-8 data by treating original_buffer as char*
-            const char* buf = (const char*)doc->original_buffer;
-            for (size_t i = 0; i < curr->length; i++) {
-                if (buf[curr->start + i] == '\n') {
-                    if (doc->line_count >= doc->line_capacity) {
-                        doc->line_capacity *= 2;
-                        doc->line_offsets = realloc(doc->line_offsets, doc->line_capacity * sizeof(size_t));
-                    }
-                    doc->line_offsets[doc->line_count++] = logical_base + i + 1;
-                }
-            }
-        } else {
-            // Scan UTF-16 data by treating the buffer as WCHAR*
-            const WCHAR* buf = (curr->buffer == BUFFER_ORIGINAL) ? 
-                               (WCHAR*)doc->original_buffer : doc->add_buffer;
-            if (buf) {
-                for (size_t i = 0; i < curr->length; i++) {
-                    if (buf[curr->start + i] == L'\n') {
-                        if (doc->line_count >= doc->line_capacity) {
-                            doc->line_capacity *= 2;
-                            doc->line_offsets = realloc(doc->line_offsets, doc->line_capacity * sizeof(size_t));
-                        }
-                        doc->line_offsets[doc->line_count++] = logical_base + i + 1;
-                    }
-                }
-            }
-        }
-        logical_base += curr->length;
-        curr = curr->next;
-    }
-
-    // Update total length and cap the line map
-    doc->total_length = logical_base;
-    if (doc->line_count >= doc->line_capacity) {
-        doc->line_offsets = realloc(doc->line_offsets, (doc->line_count + 1) * sizeof(size_t));
-    }
-    doc->line_offsets[doc->line_count] = doc->total_length;
 }
 
 void Doc_ClearUndoStack(SlateDoc* pDoc) {
@@ -286,7 +308,9 @@ BOOL Doc_Redo(SlateDoc* pDoc, size_t* outCursor) {
 }
 
 size_t Doc_GetLineOffset(SlateDoc* doc, size_t lineIndex) {
-    if (!doc || lineIndex >= doc->line_count) return doc->total_length;
+    if (!doc) return 0;
+    Doc_EnsureLineForIndex(doc, lineIndex);
+    if (lineIndex >= doc->line_count) return doc->total_length;
     return doc->line_offsets[lineIndex];
 }
 
@@ -401,9 +425,6 @@ BOOL Doc_Insert(SlateDoc* doc, size_t offset, const WCHAR* text, size_t len) {
 
     // Update metadata and line map
     Doc_RefreshMetadata(doc);
-    
-    // Explicitly update line map if it's a separate UI requirement
-    Doc_UpdateLineMap(doc); 
 
     return TRUE;
 }
@@ -448,9 +469,8 @@ BOOL Doc_Delete(SlateDoc* doc, size_t offset, size_t len) {
         }
     }
 
-    // Refresh metadata and rebuild the line map
+    // Refresh metadata and line map
     Doc_RefreshMetadata(doc);
-    Doc_UpdateLineMap(doc);
     
     return TRUE;
 }
@@ -505,7 +525,6 @@ SlateDoc* Doc_CreateEmpty() {
     doc->original_is_utf8 = TRUE;
     doc->add_capacity = 8192;
     doc->add_buffer = (WCHAR*)malloc(doc->add_capacity * sizeof(WCHAR));
-    Doc_UpdateLineMap(doc); // Initializes line_offsets with 0
     Doc_RefreshMetadata(doc);
     return doc;
 }
@@ -518,6 +537,8 @@ void Doc_GetOffsetInfo(SlateDoc* doc, size_t offset, int* out_line, int* out_col
         *out_line = 1; *out_col = 1;
         return;
     }
+
+    Doc_EnsureLineMapUpTo(doc, offset);
 
     // Binary search or linear scan through the line map
     int line = 1;

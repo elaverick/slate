@@ -34,6 +34,12 @@ typedef struct {
     Piece* head;
     size_t total_length;
 
+    // Lazy line-map state
+    BOOL    line_map_complete;      // TRUE once we've scanned to EOF
+    size_t  line_scan_offset;       // Logical offset already scanned for newlines
+    Piece*  line_scan_piece;        // Piece where scanning will resume
+    size_t  line_scan_piece_offset; // Offset within that piece
+
     UndoStep* undo_stack;
     UndoStep* redo_stack;
 
@@ -51,7 +57,6 @@ void      Doc_StreamToBuffer(SlateDoc* doc, void (*callback)(const WCHAR*, size_
 size_t    Doc_GetText(SlateDoc* doc, size_t offset, size_t len, WCHAR* dest);
 void      Doc_GetOffsetInfo(SlateDoc* doc, size_t offset, int* out_line, int* out_col);
 size_t    Doc_GetLineOffset(SlateDoc* doc, size_t lineIndex);
-void      Doc_UpdateLineMap(SlateDoc* doc);
 BOOL      Doc_Insert(SlateDoc* doc, size_t offset, const WCHAR* text, size_t len);
 BOOL      Doc_Delete(SlateDoc* doc, size_t offset, size_t len);
 BOOL      Doc_Undo(SlateDoc* pDoc, size_t* outCursor);
