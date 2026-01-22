@@ -5,6 +5,7 @@
 #define _USE_MATH_DEFINES
 #include <math.h>
 #include <wchar.h>
+#include <wctype.h>
 
 static int GetTotalWrappedHeight(HWND hwnd, ViewState* pState, int wrapWidth);
 static ViewState* GetState(HWND hwnd) {
@@ -121,6 +122,50 @@ static BOOL View_GetSelection(const ViewState* pState, size_t* pStart, size_t* p
     size_t b = pState->selectionAnchor;
     *pStart = (a < b) ? a : b;
     *pLen = (a < b) ? (b - a) : (a - b);
+    return TRUE;
+}
+
+static BOOL IsWordChar(WCHAR ch) {
+    return iswalnum(ch);
+}
+
+// Finds the word bounds surrounding 'offset'. Returns FALSE if no word is under/adjacent to the offset.
+static BOOL View_GetWordBounds(SlateDoc* pDoc, size_t offset, size_t* pStart, size_t* pEnd) {
+    if (!pDoc || !pStart || !pEnd) return FALSE;
+    if (pDoc->total_length == 0) return FALSE;
+
+    size_t totalLen = pDoc->total_length;
+    if (offset > totalLen) offset = totalLen;
+    size_t pos = offset;
+    if (pos >= totalLen) pos = totalLen - 1;
+
+    WCHAR ch = 0;
+    Doc_GetText(pDoc, pos, 1, &ch);
+    if (!IsWordChar(ch)) {
+        if (pos == 0) return FALSE;
+        Doc_GetText(pDoc, pos - 1, 1, &ch);
+        if (!IsWordChar(ch)) return FALSE;
+        pos--;
+    }
+
+    size_t start = pos;
+    while (start > 0) {
+        WCHAR prev = 0;
+        Doc_GetText(pDoc, start - 1, 1, &prev);
+        if (!IsWordChar(prev)) break;
+        start--;
+    }
+
+    size_t end = pos + 1;
+    while (end < totalLen) {
+        WCHAR next = 0;
+        Doc_GetText(pDoc, end, 1, &next);
+        if (!IsWordChar(next)) break;
+        end++;
+    }
+
+    *pStart = start;
+    *pEnd = end;
     return TRUE;
 }
 
@@ -2164,6 +2209,37 @@ static LRESULT HandleLButtonDown(HWND hwnd, ViewState* pState, WPARAM wParam, LP
     return 0;
 }
 
+static LRESULT HandleLButtonDblClk(HWND hwnd, ViewState* pState, WPARAM wParam, LPARAM lParam) {
+    (void)wParam;
+    if (!pState || !pState->pDoc) return 0;
+
+    SetFocus(hwnd);
+    ResetCaretBlink(pState);
+
+    size_t offset = GetOffsetFromPoint(hwnd, pState, GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+
+    if (pState->bCommandMode) {
+        ExitCommandMode(hwnd, pState);
+    }
+
+    size_t wordStart = 0, wordEnd = 0;
+    if (View_GetWordBounds(pState->pDoc, offset, &wordStart, &wordEnd)) {
+        pState->selectionAnchor = wordStart;
+        pState->cursorOffset = wordEnd;
+    } else {
+        pState->selectionAnchor = offset;
+        pState->cursorOffset = offset;
+    }
+
+    pState->isDragging = FALSE;
+
+    NotifyParent(hwnd, EN_SELCHANGE);
+    EnsureCursorVisible(hwnd, pState);
+    UpdateCaretPosition(hwnd, pState);
+    InvalidateRect(hwnd, NULL, TRUE);
+    return 0;
+}
+
 static LRESULT HandleDestroy(ViewState* pState) {
     if (pState->hCaretBm) DeleteObject(pState->hCaretBm);
     DeleteObject(pState->hFont);
@@ -2189,6 +2265,7 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
         case WM_SIZE:        return HandleSize(hwnd, pState, wParam, lParam);
         case WM_SETFOCUS:    return HandleSetFocus(hwnd, pState);
         case WM_KILLFOCUS:   return HandleKillFocus(hwnd, pState);
+        case WM_LBUTTONDBLCLK:return HandleLButtonDblClk(hwnd, pState, wParam, lParam);
         case WM_LBUTTONDOWN: return HandleLButtonDown(hwnd, pState, wParam, lParam);
         case WM_CONTEXTMENU: return HandleContextMenu(hwnd, pState, lParam);
         case WM_DESTROY:     return HandleDestroy(pState);
@@ -2203,6 +2280,6 @@ BOOL View_Register(HINSTANCE hInstance) {
     wc.lpszClassName = _T("SlateView");
     wc.hCursor = LoadCursor(NULL, IDC_IBEAM);
     wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
-    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
     return RegisterClass(&wc);
 }
