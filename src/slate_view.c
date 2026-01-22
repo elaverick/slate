@@ -579,6 +579,63 @@ size_t GetOffsetFromPoint(HWND hwnd, ViewState* pState, int x, int y) {
     return lineStart + col;
 }
 
+void UpdateCaretPosition(HWND hwnd, ViewState* pState) {
+    if (!pState || !pState->pDoc || GetFocus() != hwnd) return;
+
+    int x = pState->bWordWrap ? 5 : (5 - pState->scrollX);
+    int y = 0; // y stays client-relative
+    int cursorLine, cursorCol;
+    Doc_GetOffsetInfo(pState->pDoc, pState->cursorOffset, &cursorLine, &cursorCol);
+
+    if (pState->bCommandMode) {
+        HDC hdc = GetDC(hwnd);
+        SelectObject(hdc, pState->hFont);
+
+        // Measure ":text" to place the caret correctly in the prompt
+        WCHAR temp[260];
+        int len = swprintf(temp, 260, L":%.*s", (int)pState->commandCaretPos, pState->szCommandBuf);
+        SIZE sz = {0};
+        GetTextExtentPoint32W(hdc, temp, len, &sz);
+        RECT clientRc;
+        GetClientRect(hwnd, &clientRc);
+        y = GetCommandPromptTopY(pState, hdc, clientRc);
+        if (y == INT_MIN) y = 0;
+        ReleaseDC(hwnd, hdc);
+
+        x += sz.cx;
+    } else if (pState->bWordWrap) {
+        GetCursorVisualPos(hwnd, pState, pState->cursorOffset, &x, &y);
+    } else {
+        HDC hdc = GetDC(hwnd);
+        SelectObject(hdc, pState->hFont);
+        
+        TEXTMETRIC tm;
+        GetTextMetrics(hdc, &tm);
+        int tabStops = tm.tmAveCharWidth * 4; // MATCH WM_PAINT EXACTLY
+
+        int visualLine = cursorLine - 1;
+
+        y = (visualLine * pState->lineHeight) - pState->scrollY;
+
+        size_t lineStart = Doc_GetLineOffset(pState->pDoc, cursorLine - 1);
+        size_t len = pState->cursorOffset - lineStart;
+        WCHAR* lineBuf = (WCHAR*)malloc((len + 1) * sizeof(WCHAR));
+        if (lineBuf) {
+            Doc_GetText(pState->pDoc, lineStart, len, lineBuf);
+            lineBuf[len] = L'\0';
+            x += LOWORD(GetTabbedTextExtentW(hdc, lineBuf, (int)len, 1, &tabStops));
+            free(lineBuf);
+        }
+        ReleaseDC(hwnd, hdc);
+    }
+    
+    // Save these so DrawCustomCaret knows where to go!
+    pState->caretX = x;
+    pState->caretY = y;
+    
+    SetCaretPos(x, y);
+}
+
 void View_SetInsertMode(HWND hwnd, BOOL bInsert) {
     ViewState* pState = GetState(hwnd);
     if (pState) {
@@ -722,6 +779,39 @@ void View_Paste(HWND hwnd) {
     }
 }
 
+static BOOL ClipboardHasText(HWND hwnd) {
+    if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) return FALSE;
+
+    BOOL hasText = FALSE;
+    if (OpenClipboard(hwnd)) {
+        HANDLE hData = GetClipboardData(CF_UNICODETEXT);
+        if (hData) {
+            const WCHAR* pText = (const WCHAR*)GlobalLock(hData);
+            if (pText) {
+                hasText = (pText[0] != L'\0');
+                GlobalUnlock(hData);
+            }
+        }
+        CloseClipboard();
+    }
+    return hasText;
+}
+
+static void DeleteSelection(HWND hwnd, ViewState* pState) {
+    if (!pState || !pState->pDoc) return;
+
+    size_t start = 0, len = 0;
+    if (!View_GetSelection(pState, &start, &len)) return;
+
+    Doc_Delete(pState->pDoc, start, len);
+    pState->cursorOffset = pState->selectionAnchor = start;
+
+    NotifyParent(hwnd, EN_CHANGE);
+    EnsureCursorVisible(hwnd, pState);
+    UpdateCaretPosition(hwnd, pState);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
 void ResetCaretBlink(ViewState* pState) {
     pState->lastActivity = GetTickCount();
     pState->animationTime = 0.0;
@@ -738,63 +828,6 @@ void View_SetWordWrap(HWND hwnd, BOOL bWrap) {
         UpdateScrollbars(hwnd, pState);
         InvalidateRect(hwnd, NULL, TRUE);
     }
-}
-
-void UpdateCaretPosition(HWND hwnd, ViewState* pState) {
-    if (!pState || !pState->pDoc || GetFocus() != hwnd) return;
-
-    int x = pState->bWordWrap ? 5 : (5 - pState->scrollX);
-    int y = 0; // y stays client-relative
-    int cursorLine, cursorCol;
-    Doc_GetOffsetInfo(pState->pDoc, pState->cursorOffset, &cursorLine, &cursorCol);
-
-    if (pState->bCommandMode) {
-        HDC hdc = GetDC(hwnd);
-        SelectObject(hdc, pState->hFont);
-
-        // Measure ":text" to place the caret correctly in the prompt
-        WCHAR temp[260];
-        int len = swprintf(temp, 260, L":%.*s", (int)pState->commandCaretPos, pState->szCommandBuf);
-        SIZE sz = {0};
-        GetTextExtentPoint32W(hdc, temp, len, &sz);
-        RECT clientRc;
-        GetClientRect(hwnd, &clientRc);
-        y = GetCommandPromptTopY(pState, hdc, clientRc);
-        if (y == INT_MIN) y = 0;
-        ReleaseDC(hwnd, hdc);
-
-        x += sz.cx;
-    } else if (pState->bWordWrap) {
-        GetCursorVisualPos(hwnd, pState, pState->cursorOffset, &x, &y);
-    } else {
-        HDC hdc = GetDC(hwnd);
-        SelectObject(hdc, pState->hFont);
-        
-        TEXTMETRIC tm;
-        GetTextMetrics(hdc, &tm);
-        int tabStops = tm.tmAveCharWidth * 4; // MATCH WM_PAINT EXACTLY
-
-        int visualLine = cursorLine - 1;
-
-        y = (visualLine * pState->lineHeight) - pState->scrollY;
-
-        size_t lineStart = Doc_GetLineOffset(pState->pDoc, cursorLine - 1);
-        size_t len = pState->cursorOffset - lineStart;
-        WCHAR* lineBuf = (WCHAR*)malloc((len + 1) * sizeof(WCHAR));
-        if (lineBuf) {
-            Doc_GetText(pState->pDoc, lineStart, len, lineBuf);
-            lineBuf[len] = L'\0';
-            x += LOWORD(GetTabbedTextExtentW(hdc, lineBuf, (int)len, 1, &tabStops));
-            free(lineBuf);
-        }
-        ReleaseDC(hwnd, hdc);
-    }
-    
-    // Save these so DrawCustomCaret knows where to go!
-    pState->caretX = x;
-    pState->caretY = y;
-    
-    SetCaretPos(x, y);
 }
 
 BOOL View_ApplySearchResult(HWND hwnd, const DocSearchResult* result) {
@@ -1852,6 +1885,96 @@ static LRESULT HandlePaint(HWND hwnd, ViewState* pState) {
     return 0;
 }
 
+static LRESULT HandleContextMenu(HWND hwnd, ViewState* pState, LPARAM lParam) {
+    if (!pState || !pState->pDoc) return 0;
+
+    SetFocus(hwnd);
+    ResetCaretBlink(pState);
+
+    if (pState->bCommandMode) {
+        ExitCommandMode(hwnd, pState);
+    }
+
+    POINT screenPt;
+    BOOL keyboardInvoke = (GET_X_LPARAM(lParam) == -1 && GET_Y_LPARAM(lParam) == -1);
+    if (keyboardInvoke) {
+        GetCaretPos(&screenPt);
+        ClientToScreen(hwnd, &screenPt);
+    } else {
+        screenPt.x = GET_X_LPARAM(lParam);
+        screenPt.y = GET_Y_LPARAM(lParam);
+
+        POINT clientPt = screenPt;
+        ScreenToClient(hwnd, &clientPt);
+
+        size_t clickOffset = GetOffsetFromPoint(hwnd, pState, clientPt.x, clientPt.y);
+        size_t selStart = 0, selLen = 0;
+        BOOL hasSel = View_GetSelection(pState, &selStart, &selLen);
+        BOOL insideSel = hasSel && clickOffset >= selStart && clickOffset < selStart + selLen;
+        if (!insideSel) {
+            pState->selectionAnchor = clickOffset;
+            pState->cursorOffset = clickOffset;
+            NotifyParent(hwnd, EN_SELCHANGE);
+            EnsureCursorVisible(hwnd, pState);
+            UpdateCaretPosition(hwnd, pState);
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+    }
+
+    HMENU hMenu = CreatePopupMenu();
+    AppendMenuW(hMenu, MF_STRING, ID_EDIT_CUT, L"Cut");
+    AppendMenuW(hMenu, MF_STRING, ID_EDIT_COPY, L"Copy");
+    AppendMenuW(hMenu, MF_STRING, ID_EDIT_PASTE, L"Paste");
+    AppendMenuW(hMenu, MF_STRING, ID_EDIT_DELETE, L"Delete");
+    AppendMenuW(hMenu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(hMenu, MF_STRING, ID_EDIT_SELECT_ALL, L"Select All");
+
+    size_t selStart = 0, selLen = 0;
+    BOOL hasSelection = View_GetSelection(pState, &selStart, &selLen);
+    UINT selFlags = hasSelection ? MF_ENABLED : MF_GRAYED;
+    EnableMenuItem(hMenu, ID_EDIT_CUT, MF_BYCOMMAND | selFlags);
+    EnableMenuItem(hMenu, ID_EDIT_COPY, MF_BYCOMMAND | selFlags);
+    EnableMenuItem(hMenu, ID_EDIT_DELETE, MF_BYCOMMAND | selFlags);
+
+    BOOL canPaste = ClipboardHasText(hwnd);
+    EnableMenuItem(hMenu, ID_EDIT_PASTE, MF_BYCOMMAND | (canPaste ? MF_ENABLED : MF_GRAYED));
+
+    UINT cmd = TrackPopupMenu(hMenu, TPM_RIGHTBUTTON | TPM_RETURNCMD, screenPt.x, screenPt.y, 0, hwnd, NULL);
+    DestroyMenu(hMenu);
+
+    switch (cmd) {
+        case ID_EDIT_CUT: 
+            View_Cut(hwnd); 
+            NotifyParent(hwnd, EN_SELCHANGE);
+            break;
+        case ID_EDIT_COPY: 
+            View_Copy(hwnd); 
+            break;
+        case ID_EDIT_PASTE: 
+            View_Paste(hwnd); 
+            NotifyParent(hwnd, EN_SELCHANGE);
+            break;
+        case ID_EDIT_DELETE: 
+            DeleteSelection(hwnd, pState); 
+            NotifyParent(hwnd, EN_SELCHANGE);
+            break;
+        case ID_EDIT_SELECT_ALL:
+            View_SelectAll(hwnd);
+            NotifyParent(hwnd, EN_SELCHANGE);
+            break;
+        default:
+            break;
+    }
+
+    if (cmd != 0) {
+        EnsureCursorVisible(hwnd, pState);
+        UpdateCaretPosition(hwnd, pState);
+        UpdateScrollbars(hwnd, pState);
+    }
+
+    return 0;
+}
+
 static LRESULT HandleMouseMove(HWND hwnd, ViewState* pState, WPARAM wParam, LPARAM lParam) {
     (void)wParam;
     if (pState->isDragging) {
@@ -2067,6 +2190,7 @@ LRESULT CALLBACK ViewportProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam
         case WM_SETFOCUS:    return HandleSetFocus(hwnd, pState);
         case WM_KILLFOCUS:   return HandleKillFocus(hwnd, pState);
         case WM_LBUTTONDOWN: return HandleLButtonDown(hwnd, pState, wParam, lParam);
+        case WM_CONTEXTMENU: return HandleContextMenu(hwnd, pState, lParam);
         case WM_DESTROY:     return HandleDestroy(pState);
     }
     return DefWindowProc(hwnd, uMsg, wParam, lParam);
