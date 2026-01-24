@@ -344,25 +344,33 @@ size_t View_XYToOffset(HWND hwnd, int targetX, int targetY) {
         if (targetYDoc >= currentY && targetYDoc < currentY + totalH) {
             int visualY = targetYDoc - currentY;
             int bestOffset = 0;
-            int minDistance = 999999;
-            int currentLineBottom = 0;
-            size_t currentLineStart = 0;
+            int minScore = INT_MAX;
+            int currentLineBottom = pState->lineHeight;
+            int lineTop = 0;
+            size_t visualLineStart = 0;
+
             for (size_t k = 0; k <= dLen; k++) {
                 RECT rcM = { 0, 0, wrapWidth, 0 };
                 DrawTextW(hdc, buf, (int)k, &rcM, DT_WORDBREAK | DT_EXPANDTABS | DT_CALCRECT | DT_NOPREFIX);
                 if (rcM.bottom > currentLineBottom) {
+                    lineTop = currentLineBottom;
                     currentLineBottom = rcM.bottom;
-                    currentLineStart = (k > 0) ? k - 1 : 0;
-                    while (currentLineStart < dLen && (buf[currentLineStart] == L' ' || buf[currentLineStart] == L'\t')) currentLineStart++;
+                    visualLineStart = (k > 0) ? k - 1 : 0;
+                    while (visualLineStart < dLen && (buf[visualLineStart] == L' ' || buf[visualLineStart] == L'\t')) visualLineStart++;
                 }
-                int cy = (rcM.bottom <= 0) ? 0 : currentLineBottom - pState->lineHeight;
+                int lineBottom = (rcM.bottom <= 0) ? pState->lineHeight : currentLineBottom;
+                int lineTopY = lineTop;
 
-                DWORD extent = GetTabbedTextExtentW(hdc, buf + currentLineStart, (int)(k - currentLineStart), 1, &tabStops);
+                DWORD extent = GetTabbedTextExtentW(hdc, buf + visualLineStart, (int)(k - visualLineStart), 1, &tabStops);
                 int cx = 5 + LOWORD(extent);
 
-                int dist = abs(cy - visualY) * 100 + abs(cx - targetX);
-                if (dist < minDistance) {
-                    minDistance = dist;
+                int verticalDist = 0;
+                if (visualY < lineTopY) verticalDist = lineTopY - visualY;
+                else if (visualY >= lineBottom) verticalDist = visualY - lineBottom + 1;
+
+                int score = verticalDist * 200 + abs(cx - targetX);
+                if (score < minScore) {
+                    minScore = score;
                     bestOffset = (int)k;
                 }
             }
@@ -896,7 +904,7 @@ BOOL View_ApplySearchResult(HWND hwnd, const DocSearchResult* result) {
     return TRUE;
 }
 
-static void PaintWrappedContent(ViewState* pState, HDC memDC, RECT rc, int tabStops, COLORREF currentDim) {
+static void PaintWrappedContent(ViewState* pState, HDC memDC, RECT rc, int tabStops, COLORREF currentText, COLORREF currentDim, size_t selStart, size_t selEnd, BOOL hasFocus) {
     int currentY = -pState->scrollY;
     RECT textRect = rc;
     textRect.left += 5; 
@@ -906,7 +914,13 @@ static void PaintWrappedContent(ViewState* pState, HDC memDC, RECT rc, int tabSt
     Doc_GetOffsetInfo(pState->pDoc, pState->cursorOffset, &cursorLine, &cursorCol);
 
     SetBkMode(memDC, TRANSPARENT);
+    SetTextColor(memDC, currentText);
     int commandSpace = GetCommandSpaceHeight(pState);
+
+    BOOL hasSelection = (selStart != selEnd);
+    COLORREF selBg = hasFocus ? GetSysColor(COLOR_HIGHLIGHT) : GetSysColor(COLOR_3DFACE);
+    COLORREF selText = hasFocus ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_BTNTEXT);
+    HBRUSH hSelBrush = hasSelection ? CreateSolidBrush(selBg) : NULL;
 
     for (size_t i = 0; i < pState->pDoc->line_count; i++) {
         if (commandSpace > 0 && (int)i == (cursorLine - 1)) {
@@ -942,6 +956,51 @@ static void PaintWrappedContent(ViewState* pState, HDC memDC, RECT rc, int tabSt
         }
         
         DrawTextW(memDC, buf, (int)dLen, &drawRect, DT_WORDBREAK | DT_EXPANDTABS | DT_NOPREFIX);
+
+        // Selection overlay (wrapped)
+        if (hasSelection && selStart < lineEnd && selEnd > lineStart && hSelBrush) {
+            size_t lineSelStart = (selStart > lineStart) ? selStart : lineStart;
+            size_t lineSelEnd = (selEnd < lineEnd) ? selEnd : lineEnd;
+            size_t relSelStart = lineSelStart - lineStart;
+            size_t relSelEnd = lineSelEnd - lineStart;
+
+            size_t visualLineStart = 0;
+            int currentLineBottom = pState->lineHeight;
+            for (size_t k = 1; k <= dLen; k++) {
+                RECT rcPartial = { 0, 0, textRect.right - textRect.left, 0 };
+                DrawTextW(memDC, buf, (int)k, &rcPartial, DT_WORDBREAK | DT_EXPANDTABS | DT_CALCRECT | DT_NOPREFIX);
+                BOOL newLine = (rcPartial.bottom > currentLineBottom);
+                BOOL lastChar = (k == dLen);
+                if (newLine || lastChar) {
+                    size_t lineEndExclusive = newLine ? k - 1 : k;
+                    if (lineEndExclusive < visualLineStart) lineEndExclusive = visualLineStart;
+
+                    size_t selStartInLine = (relSelStart > visualLineStart) ? relSelStart : visualLineStart;
+                    size_t selEndInLine = (relSelEnd < lineEndExclusive) ? relSelEnd : lineEndExclusive;
+
+                    if (selStartInLine < selEndInLine) {
+                        DWORD ext1 = GetTabbedTextExtentW(memDC, buf + visualLineStart, (int)(selStartInLine - visualLineStart), 1, &tabStops);
+                        DWORD ext2 = GetTabbedTextExtentW(memDC, buf + visualLineStart, (int)(selEndInLine - visualLineStart), 1, &tabStops);
+
+                        int x1 = textRect.left + LOWORD(ext1);
+                        int x2 = textRect.left + LOWORD(ext2);
+                        int lineBottom = rcPartial.bottom;
+                        if (lineBottom < pState->lineHeight) lineBottom = pState->lineHeight;
+                        int lineTop = currentY + lineBottom - pState->lineHeight;
+                        RECT selRect = { x1, lineTop, x2, lineTop + pState->lineHeight };
+
+                        FillRect(memDC, &selRect, hSelBrush);
+                        COLORREF oldClr = SetTextColor(memDC, selText);
+                        SetBkMode(memDC, TRANSPARENT);
+                        TabbedTextOutW(memDC, x1, lineTop, buf + selStartInLine, (int)(selEndInLine - selStartInLine), 1, &tabStops, x1);
+                        SetTextColor(memDC, oldClr);
+                    }
+
+                    visualLineStart = newLine ? k - 1 : lineEndExclusive;
+                    currentLineBottom = rcPartial.bottom;
+                }
+            }
+        }
 
         // 4. Handle non-printable characters (Pilcrow)
         if (pState->bShowNonPrintable) {
@@ -979,6 +1038,7 @@ static void PaintWrappedContent(ViewState* pState, HDC memDC, RECT rc, int tabSt
 
         if (currentY > rc.bottom) break;
     }
+    if (hSelBrush) DeleteObject(hSelBrush);
 }
 
 static void PaintUnwrappedContent(ViewState* pState, HDC memDC, RECT rc, int tabStops, COLORREF currentBg, COLORREF currentText, COLORREF currentDim, size_t selStart, size_t selEnd, BOOL hasFocus) {
@@ -1908,7 +1968,7 @@ static LRESULT HandlePaint(HWND hwnd, ViewState* pState) {
 
     if (pState->pDoc && pState->pDoc->line_count > 0) {
         if (pState->bWordWrap) {
-            PaintWrappedContent(pState, memDC, rc, tabStops, currentDim);
+            PaintWrappedContent(pState, memDC, rc, tabStops, currentText, currentDim, selStart, selEnd, hasFocus);
         } else {
             PaintUnwrappedContent(pState, memDC, rc, tabStops, currentBg, currentText, currentDim, selStart, selEnd, hasFocus);
         }

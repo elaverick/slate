@@ -10,13 +10,25 @@ This editor is intentionally simple. It’s designed to sit somewhere between a 
 ## Features
 
 - File operations: New, Open, Save, Save As, Exit
-- Edit functions: Cut, Copy, Paste, Delete, Select All
+- Edit functions: Undo, Redo, Cut, Copy, Paste, Delete, Select All
 - Right-click context menu with edit operations
+- Find function: Search within the document, with forward/backward direction, match case, and Find Next.
+- Word Wrap toggle: Switch wrapping on or off for long lines.
+- Show Whitespace toggle: Reveal/hide spacing and non-printable characters.
+- Theme toggle: Flip between Slate’s palette and system colors.
+- Command mode: Vim-style
+  - Save (:w)
+  - quit (:q)
+  - write-and-quit (:wq)
+  - open file (:e <file>)
+  - search (:s with direction/case options).
+- Help and About dialogs
 - Status bar showing:
   - Current line and column position
   - Insert/Overwrite mode indicator
   - Caps Lock indicator
-- Help and About dialogs
+  - Whitespace display mode
+
 
 ## Building
 
