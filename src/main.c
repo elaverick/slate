@@ -4,6 +4,7 @@
  */
 
 #include "slate.h"
+#include "../resources/resource.h"
 
 /**
  * Main entry point for the application
@@ -35,11 +36,15 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     if (argv) LocalFree(argv);
 
+    HACCEL hAccel = LoadAccelerators(hInstance, MAKEINTRESOURCE(IDC_SLATE_ACCEL));
+
     // Message loop
     MSG msg = {0};
     while (GetMessage(&msg, NULL, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+        if (!TranslateAccelerator(g_app.hwnd, hAccel, &msg)) {
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
     }
 
     return (int)msg.wParam;

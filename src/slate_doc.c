@@ -121,17 +121,6 @@ static void Doc_EnsureLineMapUpTo(SlateDoc* doc, size_t targetOffset) {
     }
 }
 
-static void Doc_EnsureLineForIndex(SlateDoc* doc, size_t lineIndex) {
-    if (!doc) return;
-
-    while (!doc->line_map_complete && doc->line_count <= lineIndex) {
-        size_t nextTarget = doc->line_scan_offset + LINE_SCAN_STEP_BYTES;
-        if (nextTarget > doc->total_length) nextTarget = doc->total_length;
-        Doc_EnsureLineMapUpTo(doc, nextTarget);
-        if (doc->line_scan_offset == nextTarget) break; // Avoid infinite loop on allocation failure
-    }
-}
-
 void Doc_RefreshMetadata(SlateDoc* pDoc) {
     if (!pDoc) return;
 
@@ -253,12 +242,12 @@ void Doc_PushUndo(SlateDoc* pDoc, size_t currentCursor, BOOL isNewAction) {
     }
 }
 
-BOOL Doc_Undo(SlateDoc* pDoc, size_t* outCursor) {
+BOOL Doc_Undo(SlateDoc* pDoc, size_t currentCursor, size_t* outCursor) {
     if (!pDoc->undo_stack) return FALSE;
 
     // Before restoring the old state, save the current state to Redo so we can undo the undo
     UndoStep* redoStep = malloc(sizeof(UndoStep));
-    redoStep->cursor_hint = *outCursor; // Save current cursor position
+    redoStep->cursor_hint = currentCursor; // Save current cursor position
     redoStep->pieces = ClonePieceList(pDoc->head);
     redoStep->next = pDoc->redo_stack;
     pDoc->redo_stack = redoStep;
@@ -277,7 +266,7 @@ BOOL Doc_Undo(SlateDoc* pDoc, size_t* outCursor) {
     return TRUE;
 }
 
-BOOL Doc_Redo(SlateDoc* pDoc, size_t* outCursor) {
+BOOL Doc_Redo(SlateDoc* pDoc, size_t currentCursor, size_t* outCursor) {
     if (!pDoc || !pDoc->redo_stack) return FALSE;
 
     // Pop from the redo stack
@@ -285,7 +274,7 @@ BOOL Doc_Redo(SlateDoc* pDoc, size_t* outCursor) {
     pDoc->redo_stack = step->next;
 
     // Push current state to the undo stack before overwriting it
-    Doc_PushUndo(pDoc, *outCursor, FALSE);
+    Doc_PushUndo(pDoc, currentCursor, FALSE);
 
     // Clear the current active piece list
     FreePieceList(pDoc->head);
@@ -305,6 +294,18 @@ BOOL Doc_Redo(SlateDoc* pDoc, size_t* outCursor) {
     free(step);
     
     return TRUE;
+}
+
+
+void Doc_EnsureLineForIndex(SlateDoc* doc, size_t lineIndex) {
+    if (!doc) return;
+
+    while (!doc->line_map_complete && doc->line_count <= lineIndex) {
+        size_t nextTarget = doc->line_scan_offset + LINE_SCAN_STEP_BYTES;
+        if (nextTarget > doc->total_length) nextTarget = doc->total_length;
+        Doc_EnsureLineMapUpTo(doc, nextTarget);
+        if (doc->line_scan_offset == nextTarget) break; // Avoid infinite loop on allocation failure
+    }
 }
 
 size_t Doc_GetLineOffset(SlateDoc* doc, size_t lineIndex) {

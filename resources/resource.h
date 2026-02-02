@@ -3,6 +3,7 @@
 
 // Resource identifiers
 #define IDI_APP_ICON 101
+#define IDC_SLATE_ACCEL 103
 #define IDD_FIND_DIALOG 102
 #define IDC_FIND_TEXT 1001
 #define IDC_FIND_FORWARD 1002

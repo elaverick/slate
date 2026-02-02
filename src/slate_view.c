@@ -7,7 +7,7 @@
 #include <wchar.h>
 #include <wctype.h>
 
-static int GetTotalWrappedHeight(HWND hwnd, ViewState* pState, int wrapWidth);
+
 static ViewState* GetState(HWND hwnd) {
     return (ViewState*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
 }
@@ -42,34 +42,177 @@ static BOOL View_LoadLine(ViewState* pState, size_t lineIdx, size_t* pLineStart,
     return TRUE;
 }
 
-static int GetCommandPromptTopY(ViewState* pState, HDC hdc, RECT clientRc) {
+// Rebuild the visual line cache for wrapped display
+static void RebuildWrapCache(HWND hwnd, ViewState* pState) {
+    if (!pState || !pState->pDoc || !pState->bWordWrap) {
+        pState->wrapCacheValid = FALSE;
+        pState->visualLineCount = 0;
+        return;
+    }
+
+    if (pState->pDoc->line_count == 0) {
+        pState->wrapCacheValid = FALSE;
+        pState->visualLineCount = 0;
+        return;
+    }
+
+    RECT clientRect;
+    GetClientRect(hwnd, &clientRect);
+    int wrapWidth = clientRect.right - 10;
+
+    // Check if we need to rebuild - MUST check document generation!
+    if (pState->wrapCacheValid && 
+        pState->cachedWrapWidth == wrapWidth &&
+        pState->cachedDocGeneration == pState->docGeneration) {
+        return;  // Cache is still valid
+    }
+
+    // Cache is invalid, rebuild it
+    HDC hdc = GetDC(hwnd);
+    SelectObject(hdc, pState->hFont);
+
+    TEXTMETRIC tm;
+    GetTextMetrics(hdc, &tm);
+    int tabStops = tm.tmAveCharWidth * 4;
+
+    // Allocate initial capacity
+    if (!pState->visualLines) {
+        pState->visualLineCapacity = 1024;
+        pState->visualLines = (VisualLineInfo*)malloc(pState->visualLineCapacity * sizeof(VisualLineInfo));
+    }
+    pState->visualLineCount = 0;
+
+    int currentY = 0;
+
+    // Process each logical line
+    for (size_t logLine = 0; logLine < pState->pDoc->line_count; logLine++) {
+        size_t lineStart = 0, lineEnd = 0;
+        WCHAR* buf = NULL;
+        size_t dLen = 0;
+        
+        if (!View_LoadLine(pState, logLine, &lineStart, &lineEnd, &buf, &dLen)) continue;
+
+        size_t pos = 0;
+
+        while (pos < dLen) {
+            // Grow array if needed
+            if (pState->visualLineCount >= pState->visualLineCapacity) {
+                pState->visualLineCapacity *= 2;
+                VisualLineInfo* newArray = (VisualLineInfo*)realloc(
+                    pState->visualLines, 
+                    pState->visualLineCapacity * sizeof(VisualLineInfo)
+                );
+                if (!newArray) {
+                    free(buf);
+                    ReleaseDC(hwnd, hdc);
+                    pState->wrapCacheValid = FALSE;
+                    return;
+                }
+                pState->visualLines = newArray;
+            }
+
+            // Find how much text fits on this visual line
+            size_t fitLen = 0;
+            size_t lastBreakPoint = 0;
+
+            for (size_t i = pos; i < dLen; i++) {
+                WCHAR ch = buf[i];
+                
+                DWORD extent = GetTabbedTextExtentW(hdc, buf + pos, (int)(i - pos + 1), 1, &tabStops);
+                int width = LOWORD(extent);
+
+                if (width > wrapWidth) {
+                    if (lastBreakPoint > pos) {
+                        fitLen = lastBreakPoint - pos;
+                    } else if (fitLen > 0) {
+                        fitLen = fitLen;
+                    } else {
+                        fitLen = 1;
+                    }
+                    break;
+                }
+
+                fitLen = i - pos + 1;
+
+                if (ch == L' ' || ch == L'\t' || ch == L'-') {
+                    lastBreakPoint = i + 1;
+                }
+            }
+
+            if (pos + fitLen >= dLen) {
+                fitLen = dLen - pos;
+            }
+
+            // Skip leading spaces on wrapped lines
+            size_t skipLeading = 0;
+            if (pos > 0) {
+                while (skipLeading < fitLen && 
+                       (buf[pos + skipLeading] == L' ' || buf[pos + skipLeading] == L'\t')) {
+                    skipLeading++;
+                }
+            }
+
+            // Record this visual line
+            VisualLineInfo* vLine = &pState->visualLines[pState->visualLineCount++];
+            vLine->logicalLine = logLine;
+            vLine->startOffset = pos + skipLeading;
+            vLine->length = (fitLen > skipLeading) ? (fitLen - skipLeading) : 0;
+            vLine->yPosition = currentY;
+
+            pos += fitLen;
+            currentY += pState->lineHeight;
+        }
+
+        // Handle empty lines
+        if (dLen == 0) {
+            VisualLineInfo* vLine = &pState->visualLines[pState->visualLineCount++];
+            vLine->logicalLine = logLine;
+            vLine->startOffset = 0;
+            vLine->length = 0;
+            vLine->yPosition = currentY;
+            currentY += pState->lineHeight;
+        }
+
+        free(buf);
+    }
+
+    ReleaseDC(hwnd, hdc);
+    pState->cachedWrapWidth = wrapWidth;
+    pState->cachedDocGeneration = pState->docGeneration;  // Mark which document this cache is for
+    pState->wrapCacheValid = TRUE;
+}
+
+static int GetCommandPromptTopY(ViewState* pState) {
     if (!pState || !pState->pDoc || !pState->bCommandMode) return INT_MIN;
 
     int cursorLine, cursorCol;
     Doc_GetOffsetInfo(pState->pDoc, pState->cursorOffset, &cursorLine, &cursorCol);
 
-    // Unwrapped coordinates are simple
     if (!pState->bWordWrap) {
         return ((cursorLine - 1) * pState->lineHeight) - pState->scrollY;
     }
 
-    // Wrapped: accumulate heights for lines before the cursor line
-    int wrapWidth = clientRc.right - 10;
-    int currentY = -pState->scrollY;
-    for (size_t i = 0; i < pState->pDoc->line_count && (int)i < (cursorLine - 1); i++) {
-        size_t lineStart = 0, lineEnd = 0;
-        WCHAR* buf = NULL;
-        size_t dLen = 0;
-        if (!View_LoadLine(pState, i, &lineStart, &lineEnd, &buf, &dLen)) continue;
-
-        RECT measureRect = { 0, 0, wrapWidth, 0 };
-        DrawTextW(hdc, buf, (int)dLen, &measureRect, DT_WORDBREAK | DT_CALCRECT | DT_EXPANDTABS);
-        int height = measureRect.bottom - measureRect.top;
-        if (height < pState->lineHeight) height = pState->lineHeight;
-        currentY += height;
-        free(buf);
+    // Wrapped mode: find the visual line containing the cursor
+    RebuildWrapCache(GetFocus(), pState);  // You may need to pass hwnd differently
+    
+    if (!pState->wrapCacheValid || pState->visualLineCount == 0) {
+        return 0;
     }
-    return currentY;
+
+    size_t lineStart = Doc_GetLineOffset(pState->pDoc, cursorLine - 1);
+    size_t relOffset = pState->cursorOffset - lineStart;
+
+    for (size_t i = 0; i < pState->visualLineCount; i++) {
+        VisualLineInfo* vLine = &pState->visualLines[i];
+        
+        if (vLine->logicalLine == (size_t)(cursorLine - 1) &&
+            relOffset >= vLine->startOffset &&
+            relOffset <= vLine->startOffset + vLine->length) {
+            return vLine->yPosition - pState->scrollY;
+        }
+    }
+
+    return 0;
 }
 
 static void ClearCommandFeedback(ViewState* pState) {
@@ -170,11 +313,20 @@ static BOOL View_GetWordBounds(SlateDoc* pDoc, size_t offset, size_t* pStart, si
 }
 
 // Shared document height calculation for scroll math (clamped to 32-bit)
-static int View_GetDocumentHeight(HWND hwnd, ViewState* pState, int wrapWidth) {
+static int View_GetDocumentHeight(HWND hwnd, ViewState* pState) {
     if (!pState || !pState->pDoc) return 0;
+    
     if (pState->bWordWrap) {
-        int totalHeight = GetTotalWrappedHeight(hwnd, pState, wrapWidth);
-        if (totalHeight <= 0) totalHeight = pState->lineHeight;
+        RebuildWrapCache(hwnd, pState);
+        
+        if (!pState->wrapCacheValid || pState->visualLineCount == 0) {
+            return pState->lineHeight;
+        }
+        
+        // Total height is the Y position of the last line plus one line height
+        VisualLineInfo* lastLine = &pState->visualLines[pState->visualLineCount - 1];
+        int totalHeight = lastLine->yPosition + pState->lineHeight;
+        
         int extra = GetCommandSpaceHeight(pState);
         if (extra > 0) {
             if (totalHeight > INT_MAX - extra) totalHeight = INT_MAX;
@@ -182,6 +334,8 @@ static int View_GetDocumentHeight(HWND hwnd, ViewState* pState, int wrapWidth) {
         }
         return (totalHeight > INT_MAX) ? INT_MAX : totalHeight;
     }
+    
+    // Unwrapped mode
     long long totalHeight64 = (long long)pState->pDoc->line_count * pState->lineHeight;
     totalHeight64 += GetCommandSpaceHeight(pState);
     return (totalHeight64 > 2147483647LL) ? 2147483647 : (int)totalHeight64;
@@ -216,66 +370,80 @@ BOOL View_IsUsingSystemColors(HWND hwnd) {
     return pState ? pState->bUseSystemColors : TRUE;
 }
 
+
 static void GetCursorVisualPos(HWND hwnd, ViewState* pState, size_t targetOffset, int* outX, int* outY) {
     HDC hdc = GetDC(hwnd);
     SelectObject(hdc, pState->hFont);
-    RECT clientRect;
-    GetClientRect(hwnd, &clientRect);
-    int wrapWidth = clientRect.right - 10;
 
     TEXTMETRIC tm;
     GetTextMetrics(hdc, &tm);
     int tabStops = tm.tmAveCharWidth * 4;
 
-    int currentYDoc = 0; // document-space
-    size_t startLineIdx = 0;
     int finalX = 5, finalYDoc = 0;
-    BOOL found = FALSE;
 
-    for (size_t i = startLineIdx; i < pState->pDoc->line_count; i++) {
-        size_t lineStart = 0, lineEnd = 0;
-        WCHAR* buf = NULL;
-        size_t dLen = 0;
-        if (!View_LoadLine(pState, i, &lineStart, &lineEnd, &buf, &dLen)) continue;
+    if (pState->bWordWrap) {
+        RebuildWrapCache(hwnd, pState);
 
-        if (targetOffset >= lineStart && targetOffset <= lineStart + dLen) {
-            size_t rel = targetOffset - lineStart;
-            
-            // Get height of the text block up to the cursor index
-            RECT rcM = { 0, 0, wrapWidth, 0 };
-            DrawTextW(hdc, buf, (int)rel, &rcM, DT_WORDBREAK | DT_EXPANDTABS | DT_CALCRECT | DT_NOPREFIX);
-            
-            // Determine the visual line start by scanning forward
-            size_t vLineStart = 0;
-            int currentLineBottom = 0;
-            for (size_t k = 0; k <= rel; k++) {
-                RECT rcPartial = { 0, 0, wrapWidth, 0 };
-                DrawTextW(hdc, buf, (int)k, &rcPartial, DT_WORDBREAK | DT_EXPANDTABS | DT_CALCRECT | DT_NOPREFIX);
-                if (rcPartial.bottom > currentLineBottom) {
-                    currentLineBottom = rcPartial.bottom;
-                    vLineStart = (k > 0) ? k - 1 : 0;
-                    while (vLineStart < rel && (buf[vLineStart] == L' ' || buf[vLineStart] == L'\t')) vLineStart++;
-                }
-            }
-
-            finalYDoc = currentYDoc + currentLineBottom - pState->lineHeight;
-
-            DWORD extent = GetTabbedTextExtentW(hdc, buf + vLineStart, (int)(rel - vLineStart), 1, &tabStops);
-            finalX = 5 + LOWORD(extent);
-            found = TRUE;
+        if (!pState->wrapCacheValid || pState->visualLineCount == 0) {
+            ReleaseDC(hwnd, hdc);
+            *outX = 5;
+            *outY = 0;
+            return;
         }
 
-        RECT rcFull = { 0, 0, wrapWidth, 0 };
-        DrawTextW(hdc, buf, (int)dLen, &rcFull, DT_WORDBREAK | DT_EXPANDTABS | DT_CALCRECT | DT_NOPREFIX);
-        currentYDoc += (rcFull.bottom <= 0) ? pState->lineHeight : rcFull.bottom;
+        // Find which logical line contains the target offset
+        int cursorLine, cursorCol;
+        Doc_GetOffsetInfo(pState->pDoc, targetOffset, &cursorLine, &cursorCol);
+        size_t logLine = (cursorLine > 0) ? (cursorLine - 1) : 0;
         
-        free(buf);
-        if (found) break;
+        size_t lineStart = Doc_GetLineOffset(pState->pDoc, logLine);
+        size_t relOffset = targetOffset - lineStart;
+
+        // Find which visual line contains this offset
+        for (size_t i = 0; i < pState->visualLineCount; i++) {
+            VisualLineInfo* vLine = &pState->visualLines[i];
+            
+            if (vLine->logicalLine == logLine &&
+                relOffset >= vLine->startOffset &&
+                relOffset <= vLine->startOffset + vLine->length) {
+                
+                // Load the logical line
+                WCHAR* buf = NULL;
+                size_t dLen = 0;
+                if (View_LoadLine(pState, logLine, NULL, NULL, &buf, &dLen)) {
+                    // Calculate X from visual line start
+                    size_t offsetInVisualLine = relOffset - vLine->startOffset;
+                    DWORD extent = GetTabbedTextExtentW(hdc, buf + vLine->startOffset, 
+                                                       (int)offsetInVisualLine, 1, &tabStops);
+                    finalX = 5 + LOWORD(extent);
+                    finalYDoc = vLine->yPosition;
+                    free(buf);
+                }
+                break;
+            }
+        }
+    } else {
+        // Unwrapped mode (existing logic)
+        int cursorLine, cursorCol;
+        Doc_GetOffsetInfo(pState->pDoc, targetOffset, &cursorLine, &cursorCol);
+
+        finalYDoc = (cursorLine - 1) * pState->lineHeight;
+
+        size_t lineStart = Doc_GetLineOffset(pState->pDoc, cursorLine - 1);
+        size_t len = targetOffset - lineStart;
+        WCHAR* lineBuf = (WCHAR*)malloc((len + 1) * sizeof(WCHAR));
+        if (lineBuf) {
+            Doc_GetText(pState->pDoc, lineStart, len, lineBuf);
+            lineBuf[len] = L'\0';
+            DWORD extent = GetTabbedTextExtentW(hdc, lineBuf, (int)len, 1, &tabStops);
+            finalX = 5 + LOWORD(extent);
+            free(lineBuf);
+        }
     }
 
     ReleaseDC(hwnd, hdc);
-    *outX = finalX; 
-    *outY = finalYDoc - pState->scrollY; // return client-relative Y
+    *outX = finalX;
+    *outY = finalYDoc - pState->scrollY;
 }
 
 // Calculate total pixel height of wrapped content
@@ -305,86 +473,123 @@ static int GetTotalWrappedHeight(HWND hwnd, ViewState* pState, int wrapWidth) {
 // Maps X,Y back to a document offset
 size_t View_XYToOffset(HWND hwnd, int targetX, int targetY) {
     ViewState* pState = (ViewState*)GetWindowLongPtr(hwnd, GWLP_USERDATA);
-    HDC hdc = GetDC(hwnd);
-    SelectObject(hdc, pState->hFont);
+    
+    if (pState->bWordWrap) {
+        RebuildWrapCache(hwnd, pState);
 
-    TEXTMETRIC tm;
-    GetTextMetrics(hdc, &tm);
-    int tabStops = tm.tmAveCharWidth * 4;
-
-    RECT clientRc;
-    GetClientRect(hwnd, &clientRc);
-    int wrapWidth = clientRc.right - 10;
-
-    int targetYDoc = targetY + pState->scrollY; // convert to document-space Y
-    if (targetYDoc < 0) targetYDoc = 0;
-    int currentY = 0;
-    size_t resultOffset = 0;
-
-    for (size_t i = 0; i < pState->pDoc->line_count; i++) {
-        size_t lineStart = 0, lineEnd = 0;
-        size_t dLen = 0;
-        WCHAR* buf = NULL;
-        if (!View_LoadLine(pState, i, &lineStart, &lineEnd, &buf, &dLen)) {
-            lineStart = Doc_GetLineOffset(pState->pDoc, i);
-            lineEnd = (i + 1 < pState->pDoc->line_count) ? 
-                         Doc_GetLineOffset(pState->pDoc, i + 1) : pState->pDoc->total_length;
-            size_t len = lineEnd - lineStart;
-            buf = malloc((len + 1) * sizeof(WCHAR));
-            if (!buf) continue;
-            Doc_GetText(pState->pDoc, lineStart, len, buf);
-            dLen = len;
-            while (dLen > 0 && (buf[dLen-1] == L'\n' || buf[dLen-1] == L'\r')) dLen--;
+        if (!pState->wrapCacheValid || pState->visualLineCount == 0) {
+            return 0;
         }
 
-        RECT rcFull = { 0, 0, wrapWidth, 0 };
-        DrawTextW(hdc, buf, (int)dLen, &rcFull, DT_WORDBREAK | DT_EXPANDTABS | DT_CALCRECT | DT_NOPREFIX);
-        int totalH = (rcFull.bottom <= 0) ? pState->lineHeight : rcFull.bottom;
+        HDC hdc = GetDC(hwnd);
+        SelectObject(hdc, pState->hFont);
 
-        if (targetYDoc >= currentY && targetYDoc < currentY + totalH) {
-            int visualY = targetYDoc - currentY;
-            int bestOffset = 0;
-            int minScore = INT_MAX;
-            int currentLineBottom = pState->lineHeight;
-            int lineTop = 0;
-            size_t visualLineStart = 0;
+        TEXTMETRIC tm;
+        GetTextMetrics(hdc, &tm);
+        int tabStops = tm.tmAveCharWidth * 4;
 
-            for (size_t k = 0; k <= dLen; k++) {
-                RECT rcM = { 0, 0, wrapWidth, 0 };
-                DrawTextW(hdc, buf, (int)k, &rcM, DT_WORDBREAK | DT_EXPANDTABS | DT_CALCRECT | DT_NOPREFIX);
-                if (rcM.bottom > currentLineBottom) {
-                    lineTop = currentLineBottom;
-                    currentLineBottom = rcM.bottom;
-                    visualLineStart = (k > 0) ? k - 1 : 0;
-                    while (visualLineStart < dLen && (buf[visualLineStart] == L' ' || buf[visualLineStart] == L'\t')) visualLineStart++;
-                }
-                int lineBottom = (rcM.bottom <= 0) ? pState->lineHeight : currentLineBottom;
-                int lineTopY = lineTop;
+        int targetYDoc = targetY + pState->scrollY;
 
-                DWORD extent = GetTabbedTextExtentW(hdc, buf + visualLineStart, (int)(k - visualLineStart), 1, &tabStops);
-                int cx = 5 + LOWORD(extent);
+        // Find which visual line was clicked
+        VisualLineInfo* targetVLine = NULL;
+        for (size_t i = 0; i < pState->visualLineCount; i++) {
+            VisualLineInfo* vLine = &pState->visualLines[i];
+            if (targetYDoc >= vLine->yPosition && 
+                targetYDoc < vLine->yPosition + pState->lineHeight) {
+                targetVLine = vLine;
+                break;
+            }
+        }
 
-                int verticalDist = 0;
-                if (visualY < lineTopY) verticalDist = lineTopY - visualY;
-                else if (visualY >= lineBottom) verticalDist = visualY - lineBottom + 1;
+        if (!targetVLine) {
+            // Click below all lines - return end of document
+            ReleaseDC(hwnd, hdc);
+            if (pState->visualLineCount > 0) {
+                VisualLineInfo* lastVLine = &pState->visualLines[pState->visualLineCount - 1];
+                size_t lineStart = Doc_GetLineOffset(pState->pDoc, lastVLine->logicalLine);
+                return lineStart + lastVLine->startOffset + lastVLine->length;
+            }
+            return 0;
+        }
 
-                int score = verticalDist * 200 + abs(cx - targetX);
-                if (score < minScore) {
-                    minScore = score;
-                    bestOffset = (int)k;
+        // Load the logical line
+        size_t lineStart = 0;
+        WCHAR* buf = NULL;
+        size_t dLen = 0;
+        if (!View_LoadLine(pState, targetVLine->logicalLine, &lineStart, NULL, &buf, &dLen)) {
+            ReleaseDC(hwnd, hdc);
+            return lineStart;
+        }
+
+        // Find closest character in this visual line
+        size_t bestOffset = targetVLine->startOffset;
+        int minDist = INT_MAX;
+
+        for (size_t i = 0; i <= targetVLine->length; i++) {
+            DWORD extent = GetTabbedTextExtentW(hdc, buf + targetVLine->startOffset, 
+                                               (int)i, 1, &tabStops);
+            int cx = 5 + LOWORD(extent);
+            int dist = abs(cx - targetX);
+
+            if (dist < minDist) {
+                minDist = dist;
+                bestOffset = targetVLine->startOffset + i;
+            }
+        }
+
+        free(buf);
+        ReleaseDC(hwnd, hdc);
+        return lineStart + bestOffset;
+
+    } else {
+        // Unwrapped mode (existing logic)
+        HDC hdc = GetDC(hwnd);
+        SelectObject(hdc, pState->hFont);
+        
+        TEXTMETRIC tm;
+        GetTextMetrics(hdc, &tm);
+        int charWidth = tm.tmAveCharWidth;
+        ReleaseDC(hwnd, hdc);
+
+        int lineIndex = (targetY + pState->scrollY) / pState->lineHeight;
+        
+        if (lineIndex < 0) lineIndex = 0;
+        if (lineIndex >= (int)pState->pDoc->line_count) 
+            lineIndex = (int)pState->pDoc->line_count - 1;
+
+        int col = (targetX + pState->scrollX - 5 + (charWidth / 2)) / charWidth;
+        
+        size_t lineStart = 0, lineEnd = 0;
+        size_t lineLen = 0;
+        WCHAR* buf = NULL;
+        size_t dLen = 0;
+        if (View_LoadLine(pState, lineIndex, &lineStart, &lineEnd, &buf, &dLen)) {
+            lineLen = dLen;
+        } else {
+            lineStart = Doc_GetLineOffset(pState->pDoc, lineIndex);
+            lineEnd = Doc_GetLineOffset(pState->pDoc, lineIndex + 1);
+            lineLen = lineEnd - lineStart;
+
+            if (lineLen > 0) {
+                WCHAR last;
+                Doc_GetText(pState->pDoc, lineEnd - 1, 1, &last);
+                if (last == L'\n' || last == L'\r') {
+                    lineLen--;
+                    // Double check for \r\n pairs
+                    if (lineLen > 0) {
+                        Doc_GetText(pState->pDoc, lineEnd - 2, 1, &last);
+                        if (last == L'\r') lineLen--;
+                    }
                 }
             }
-            resultOffset = lineStart + bestOffset;
-            free(buf);
-            break;
         }
-        currentY += totalH;
-        free(buf);
-        resultOffset = lineStart + dLen; 
-    }
+        if (buf) free(buf);
 
-    ReleaseDC(hwnd, hdc);
-    return resultOffset;
+        if (col < 0) col = 0;
+        if ((size_t)col > lineLen) col = (int)lineLen;
+
+        return lineStart + col;
+    }
 }
 
 void EnsureCursorVisible(HWND hwnd, ViewState* pState) {
@@ -393,18 +598,24 @@ void EnsureCursorVisible(HWND hwnd, ViewState* pState) {
 
     if (pState->bWordWrap) {
         int cx, cy;
-        GetCursorVisualPos(hwnd, pState, pState->cursorOffset, &cx, &cy); // cy is client-relative
-        if (cy < 0) {
-            pState->scrollY += cy;
-        } else if (cy + pState->lineHeight > rc.bottom) {
-            pState->scrollY += (cy + pState->lineHeight) - rc.bottom;
+        GetCursorVisualPos(hwnd, pState, pState->cursorOffset, &cx, &cy);
+        
+        // cy is client-relative, convert to document-relative for comparison
+        int cyDoc = cy + pState->scrollY;
+        
+        if (cyDoc < pState->scrollY) {
+            pState->scrollY = cyDoc;
+        } else if (cyDoc + pState->lineHeight > pState->scrollY + rc.bottom) {
+            pState->scrollY = cyDoc + pState->lineHeight - rc.bottom;
         }
+        
         if (pState->scrollY < 0) pState->scrollY = 0;
-        int wrapWidth = rc.right - 10;
-        int totalH = View_GetDocumentHeight(hwnd, pState, wrapWidth);
+        
+        int totalH = View_GetDocumentHeight(hwnd, pState);
         int maxScroll = (totalH > rc.bottom) ? (totalH - rc.bottom) : 0;
         if (pState->scrollY > maxScroll) pState->scrollY = maxScroll;
     } else {
+        // Unwrapped mode - existing logic unchanged
         int line, col;
         Doc_GetOffsetInfo(pState->pDoc, pState->cursorOffset, &line, &col);
         int cursorY = (line - 1) * pState->lineHeight;
@@ -416,7 +627,6 @@ void EnsureCursorVisible(HWND hwnd, ViewState* pState) {
         }
         if (pState->scrollY < 0) pState->scrollY = 0;
 
-        // Horizontal visibility for unwrapped mode
         HDC hdc = GetDC(hwnd);
         SelectObject(hdc, pState->hFont);
         TEXTMETRIC tm;
@@ -456,15 +666,14 @@ void UpdateScrollbars(HWND hwnd, ViewState* pState) {
     RECT rc;
     GetClientRect(hwnd, &rc);
     int clientHeight = rc.bottom;
-    int wrapWidth = rc.right - 10;
 
-    // Grow the line map just enough to cover the current viewport plus a margin,
+    // Grow the line map just enough to cover the current viewport plus a margin, 
     // instead of forcing a full-file scan on load.
     int visibleLines = (pState->lineHeight > 0) ? (clientHeight / pState->lineHeight) : 0;
     size_t targetLine = (size_t)(pState->scrollY / pState->lineHeight) + visibleLines + 200;
     Doc_GetLineOffset(pState->pDoc, targetLine);
 
-    int totalHeight = View_GetDocumentHeight(hwnd, pState, wrapWidth);
+    int totalHeight = View_GetDocumentHeight(hwnd, pState);
 
     SCROLLINFO si = {0};
     si.cbSize = sizeof(si);
@@ -536,12 +745,34 @@ void View_SetDocument(HWND hwnd, SlateDoc* pDoc) {
         pState->scrollY = 0;
         pState->scrollX = 0;
         
+        // Clear the visual lines array completely
+        if (pState->visualLines) {
+            free(pState->visualLines);
+            pState->visualLines = NULL;
+        }
+        pState->visualLineCount = 0;
+        pState->visualLineCapacity = 0;
+        
+        // Increment generation to invalidate all caches
+        pState->docGeneration++;
+        pState->wrapCacheValid = FALSE;
+
+        // Ensure document's line map is initialized before wrapping
+        if (pDoc && pDoc->line_count > 0) {
+            // Force the line map to scan at least the first portion of the document
+            Doc_GetLineOffset(pDoc, 0);  // Force initialization
+        }
+
+        // If word wrap is enabled, rebuild the cache immediately
+        if (pState->bWordWrap) {
+            RebuildWrapCache(hwnd, pState);
+        }
+        
         // Reclaim caret and focus
         if (GetFocus() == hwnd) {
             DestroyCaret();
             CreateCaret(hwnd, NULL, 1, pState->lineHeight);
             SetCaretPos(5, 0);
-            //ShowCaret(hwnd);
         }
 
         // Force scrollbar and paint update
@@ -567,7 +798,7 @@ size_t GetOffsetFromPoint(HWND hwnd, ViewState* pState, int x, int y) {
         GetClientRect(hwnd, &clientRc);
         HDC hdcTmp = GetDC(hwnd);
         SelectObject(hdcTmp, pState->hFont);
-        int promptTop = GetCommandPromptTopY(pState, hdcTmp, clientRc);
+        int promptTop = GetCommandPromptTopY(pState);
         ReleaseDC(hwnd, hdcTmp);
         int commandSpace = GetCommandSpaceHeight(pState);
         if (promptTop != INT_MIN && commandSpace > 0 && targetY >= promptTop + commandSpace) {
@@ -649,9 +880,7 @@ void UpdateCaretPosition(HWND hwnd, ViewState* pState) {
         int len = swprintf(temp, 260, L":%.*s", (int)pState->commandCaretPos, pState->szCommandBuf);
         SIZE sz = {0};
         GetTextExtentPoint32W(hdc, temp, len, &sz);
-        RECT clientRc;
-        GetClientRect(hwnd, &clientRc);
-        y = GetCommandPromptTopY(pState, hdc, clientRc);
+        y = GetCommandPromptTopY(pState);
         if (y == INT_MIN) y = 0;
         ReleaseDC(hwnd, hdc);
 
@@ -727,7 +956,7 @@ void View_Undo(HWND hwnd) {
     if (!pState || !pState->pDoc) return;
 
     size_t restoredCursor;
-    if (Doc_Undo(pState->pDoc, &restoredCursor)) {
+    if (Doc_Undo(pState->pDoc, pState->cursorOffset, &restoredCursor)) {
         pState->cursorOffset = restoredCursor;
         pState->selectionAnchor = restoredCursor;
         
@@ -743,7 +972,7 @@ void View_Redo(HWND hwnd) {
     if (!pState || !pState->pDoc) return;
 
     size_t restoredCursor;
-    if (Doc_Redo(pState->pDoc, &restoredCursor)) {
+    if (Doc_Redo(pState->pDoc, pState->cursorOffset, &restoredCursor)) {
         pState->cursorOffset = restoredCursor;
         pState->selectionAnchor = restoredCursor;
         
@@ -794,6 +1023,7 @@ void View_Cut(HWND hwnd) {
     View_Copy(hwnd);
 
     Doc_Delete(pState->pDoc, start, len);
+    pState->wrapCacheValid = FALSE;
     
     // Collapse selection and update the view
     pState->cursorOffset = pState->selectionAnchor = start;
@@ -814,12 +1044,14 @@ void View_Paste(HWND hwnd) {
                 size_t start = 0, len = 0;
                 if (View_GetSelection(pState, &start, &len)) {
                     Doc_Delete(pState->pDoc, start, len);
+                    pState->wrapCacheValid = FALSE;
                     pState->cursorOffset = pState->selectionAnchor = start;
                 }
 
                 // Insert the clipboard text
                 size_t pasteLen = wcslen(pText);
                 Doc_Insert(pState->pDoc, pState->cursorOffset, pText, pasteLen);
+                pState->wrapCacheValid = FALSE;
                 pState->cursorOffset += pasteLen;
                 pState->selectionAnchor = pState->cursorOffset;
                 
@@ -857,6 +1089,7 @@ static void DeleteSelection(HWND hwnd, ViewState* pState) {
     if (!View_GetSelection(pState, &start, &len)) return;
 
     Doc_Delete(pState->pDoc, start, len);
+    pState->wrapCacheValid = FALSE;
     pState->cursorOffset = pState->selectionAnchor = start;
 
     NotifyParent(hwnd, EN_CHANGE);
@@ -876,7 +1109,8 @@ void View_SetWordWrap(HWND hwnd, BOOL bWrap) {
     ViewState* pState = GetState(hwnd);
     if (pState && pState->bWordWrap != bWrap) {
         pState->bWordWrap = bWrap;
-        pState->scrollY = 0; // Reset scroll to avoid getting lost
+        pState->wrapCacheValid = FALSE;  // Invalidate cache
+        pState->scrollY = 0;
         pState->scrollX = 0;
         UpdateScrollbars(hwnd, pState);
         InvalidateRect(hwnd, NULL, TRUE);
@@ -905,139 +1139,85 @@ BOOL View_ApplySearchResult(HWND hwnd, const DocSearchResult* result) {
 }
 
 static void PaintWrappedContent(ViewState* pState, HDC memDC, RECT rc, int tabStops, COLORREF currentText, COLORREF currentDim, size_t selStart, size_t selEnd, BOOL hasFocus) {
-    int currentY = -pState->scrollY;
-    RECT textRect = rc;
-    textRect.left += 5; 
-    textRect.right -= 5;
+    RebuildWrapCache(GetFocus(), pState);  // Note: You'll need to pass hwnd to this function
 
-    int cursorLine, cursorCol;
-    Doc_GetOffsetInfo(pState->pDoc, pState->cursorOffset, &cursorLine, &cursorCol);
+    if (!pState->wrapCacheValid || pState->visualLineCount == 0) {
+        return;
+    }
 
     SetBkMode(memDC, TRANSPARENT);
     SetTextColor(memDC, currentText);
-    int commandSpace = GetCommandSpaceHeight(pState);
 
     BOOL hasSelection = (selStart != selEnd);
     COLORREF selBg = hasFocus ? GetSysColor(COLOR_HIGHLIGHT) : GetSysColor(COLOR_3DFACE);
     COLORREF selText = hasFocus ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_BTNTEXT);
     HBRUSH hSelBrush = hasSelection ? CreateSolidBrush(selBg) : NULL;
 
-    for (size_t i = 0; i < pState->pDoc->line_count; i++) {
-        if (commandSpace > 0 && (int)i == (cursorLine - 1)) {
-            currentY += commandSpace;
-        }
+    // Draw each visual line
+    for (size_t i = 0; i < pState->visualLineCount; i++) {
+        VisualLineInfo* vLine = &pState->visualLines[i];
+        
+        int yPos = vLine->yPosition - pState->scrollY;
+        
+        // Skip lines outside viewport
+        if (yPos + pState->lineHeight < 0) continue;
+        if (yPos > rc.bottom) break;
 
-        size_t lineStart = 0, lineEnd = 0;
+        // Load logical line
+        size_t lineStart = 0;
         WCHAR* buf = NULL;
         size_t dLen = 0;
-        if (!View_LoadLine(pState, i, &lineStart, &lineEnd, &buf, &dLen)) continue;
+        if (!View_LoadLine(pState, vLine->logicalLine, &lineStart, NULL, &buf, &dLen)) continue;
 
-        // 1. Calculate height for this wrapped line
-        RECT measureRect = textRect;
-        measureRect.top = 0; // Use 0 for calculation to avoid overflow issues
-        DrawTextW(memDC, buf, (int)dLen, &measureRect, DT_WORDBREAK | DT_CALCRECT | DT_EXPANDTABS);
-        int height = measureRect.bottom - measureRect.top;
+        // Draw text for this visual line
+        if (vLine->length > 0) {
+            TabbedTextOutW(memDC, 5, yPos, buf + vLine->startOffset, (int)vLine->length, 1, &tabStops, 5);
 
-        // 2. Adjust height to be a multiple of our standard lineHeight
-        // This fixes the spacing discrepancy between modes
-        if (height < pState->lineHeight) height = pState->lineHeight;
+            // Handle selection overlay
+            size_t absStart = lineStart + vLine->startOffset;
+            size_t absEnd = absStart + vLine->length;
 
-        // 3. Draw the actual text
-        RECT drawRect = textRect;
-        drawRect.top = currentY;
-        drawRect.bottom = currentY + height;
+            if (hasSelection && selStart < absEnd && selEnd > absStart) {
+                size_t selStartInLine = (selStart > absStart) ? selStart : absStart;
+                size_t selEndInLine = (selEnd < absEnd) ? selEnd : absEnd;
 
-        // Skip blocks completely above the viewport but advance Y
-        if (drawRect.bottom <= 0) {
-            currentY += height;
-            free(buf);
-            if (currentY > rc.bottom) break;
-            continue;
-        }
-        
-        DrawTextW(memDC, buf, (int)dLen, &drawRect, DT_WORDBREAK | DT_EXPANDTABS | DT_NOPREFIX);
+                size_t relSelStart = selStartInLine - absStart;
+                size_t relSelEnd = selEndInLine - absStart;
 
-        // Selection overlay (wrapped)
-        if (hasSelection && selStart < lineEnd && selEnd > lineStart && hSelBrush) {
-            size_t lineSelStart = (selStart > lineStart) ? selStart : lineStart;
-            size_t lineSelEnd = (selEnd < lineEnd) ? selEnd : lineEnd;
-            size_t relSelStart = lineSelStart - lineStart;
-            size_t relSelEnd = lineSelEnd - lineStart;
+                DWORD ext1 = GetTabbedTextExtentW(memDC, buf + vLine->startOffset, (int)relSelStart, 1, &tabStops);
+                DWORD ext2 = GetTabbedTextExtentW(memDC, buf + vLine->startOffset, (int)relSelEnd, 1, &tabStops);
 
-            size_t visualLineStart = 0;
-            int currentLineBottom = pState->lineHeight;
-            for (size_t k = 1; k <= dLen; k++) {
-                RECT rcPartial = { 0, 0, textRect.right - textRect.left, 0 };
-                DrawTextW(memDC, buf, (int)k, &rcPartial, DT_WORDBREAK | DT_EXPANDTABS | DT_CALCRECT | DT_NOPREFIX);
-                BOOL newLine = (rcPartial.bottom > currentLineBottom);
-                BOOL lastChar = (k == dLen);
-                if (newLine || lastChar) {
-                    size_t lineEndExclusive = newLine ? k - 1 : k;
-                    if (lineEndExclusive < visualLineStart) lineEndExclusive = visualLineStart;
+                int x1 = 5 + LOWORD(ext1);
+                int x2 = 5 + LOWORD(ext2);
 
-                    size_t selStartInLine = (relSelStart > visualLineStart) ? relSelStart : visualLineStart;
-                    size_t selEndInLine = (relSelEnd < lineEndExclusive) ? relSelEnd : lineEndExclusive;
+                RECT selRect = { x1, yPos, x2, yPos + pState->lineHeight };
+                FillRect(memDC, &selRect, hSelBrush);
 
-                    if (selStartInLine < selEndInLine) {
-                        DWORD ext1 = GetTabbedTextExtentW(memDC, buf + visualLineStart, (int)(selStartInLine - visualLineStart), 1, &tabStops);
-                        DWORD ext2 = GetTabbedTextExtentW(memDC, buf + visualLineStart, (int)(selEndInLine - visualLineStart), 1, &tabStops);
+                SetTextColor(memDC, selText);
+                SetBkMode(memDC, TRANSPARENT);
+                TabbedTextOutW(memDC, x1, yPos, buf + vLine->startOffset + relSelStart, 
+                              (int)(relSelEnd - relSelStart), 1, &tabStops, x1);
+                SetTextColor(memDC, currentText);
+            }
 
-                        int x1 = textRect.left + LOWORD(ext1);
-                        int x2 = textRect.left + LOWORD(ext2);
-                        int lineBottom = rcPartial.bottom;
-                        if (lineBottom < pState->lineHeight) lineBottom = pState->lineHeight;
-                        int lineTop = currentY + lineBottom - pState->lineHeight;
-                        RECT selRect = { x1, lineTop, x2, lineTop + pState->lineHeight };
-
-                        FillRect(memDC, &selRect, hSelBrush);
-                        COLORREF oldClr = SetTextColor(memDC, selText);
-                        SetBkMode(memDC, TRANSPARENT);
-                        TabbedTextOutW(memDC, x1, lineTop, buf + selStartInLine, (int)(selEndInLine - selStartInLine), 1, &tabStops, x1);
-                        SetTextColor(memDC, oldClr);
+            // Non-printable characters
+            if (pState->bShowNonPrintable) {
+                COLORREF oldClr = SetTextColor(memDC, currentDim);
+                for (size_t k = 0; k < vLine->length; k++) {
+                    WCHAR ch = buf[vLine->startOffset + k];
+                    if (ch == L' ' || ch == L'\t') {
+                        WCHAR sym = (ch == L' ') ? 0x00B7 : 0x00BB;
+                        DWORD extent = GetTabbedTextExtentW(memDC, buf + vLine->startOffset, (int)k, 1, &tabStops);
+                        TextOutW(memDC, 5 + LOWORD(extent), yPos, &sym, 1);
                     }
-
-                    visualLineStart = newLine ? k - 1 : lineEndExclusive;
-                    currentLineBottom = rcPartial.bottom;
                 }
+                SetTextColor(memDC, oldClr);
             }
-        }
-
-        // 4. Handle non-printable characters (Pilcrow)
-        if (pState->bShowNonPrintable) {
-            COLORREF oldClr = SetTextColor(memDC, currentDim);
-
-            // Draw whitespace markers within the wrapped block
-            int currentLineBottom = 0;
-            size_t currentLineStart = 0;
-            for (size_t k = 0; k < dLen; k++) {
-                RECT rcPartial = { 0, 0, textRect.right - textRect.left, 0 };
-                DrawTextW(memDC, buf, (int)(k + 1), &rcPartial, DT_WORDBREAK | DT_EXPANDTABS | DT_CALCRECT | DT_NOPREFIX);
-                if (rcPartial.bottom > currentLineBottom) {
-                    currentLineBottom = rcPartial.bottom;
-                    currentLineStart = (k > 0) ? k - 1 : 0;
-                    while (currentLineStart < dLen && (buf[currentLineStart] == L' ' || buf[currentLineStart] == L'\t')) currentLineStart++;
-                }
-                if (buf[k] == L' ' || buf[k] == L'\t') {
-                    DWORD extentBefore = GetTabbedTextExtentW(memDC, buf + currentLineStart, (int)(k - currentLineStart), 1, &tabStops);
-                    int charX = textRect.left + LOWORD(extentBefore);
-                    int lineY = currentY + currentLineBottom - pState->lineHeight;
-                    WCHAR sym = (buf[k] == L' ') ? 0x00B7 : 0x00BB;
-                    TextOutW(memDC, charX, lineY, &sym, 1);
-                }
-            }
-
-            if (lineEnd < pState->pDoc->total_length) {
-                WCHAR pilcrow = 0x00B6;
-                DrawTextW(memDC, &pilcrow, 1, &drawRect, DT_SINGLELINE | DT_RIGHT | DT_BOTTOM | DT_NOPREFIX);
-            }
-            SetTextColor(memDC, oldClr);
         }
 
         free(buf);
-        currentY += height;
-
-        if (currentY > rc.bottom) break;
     }
+
     if (hSelBrush) DeleteObject(hSelBrush);
 }
 
@@ -1125,7 +1305,7 @@ static void PaintCommandOverlay(ViewState* pState, HDC memDC, RECT rc) {
     int commandSpace = GetCommandSpaceHeight(pState);
     if (commandSpace <= 0) return;
 
-    int promptY = GetCommandPromptTopY(pState, memDC, rc);
+    int promptY = GetCommandPromptTopY(pState);
     if (promptY == INT_MIN) return;
 
     int baseX = pState->bWordWrap ? 5 : (5 - pState->scrollX);
@@ -1190,6 +1370,13 @@ static LRESULT HandleCreate(HWND hwnd) {
     pState->caretAlpha = 0.0f;     // Start transparent
     pState->caretDirection = 1;    // Prepare to fade in
     pState->scrollX = 0;
+    pState->visualLines = NULL;
+    pState->visualLineCount = 0;
+    pState->visualLineCapacity = 0;
+    pState->cachedWrapWidth = 0;
+    pState->wrapCacheValid = FALSE;
+    pState->docGeneration = 0; 
+    pState->cachedDocGeneration = 0; 
     
     // 2. Create Font
     pState->hFont = CreateFont(18, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, 
@@ -1524,8 +1711,7 @@ static BOOL ProcessCommandText(HWND hwnd, WCHAR* text, CommandError* pError)
         cmdWordLen++;
 
     ExCommand cmd;
-    if (!ParseExCommand(pCmd, &cmd))
-    {
+    if (!ParseExCommand(pCmd, &cmd)) {
         if (pError) {
             pError->message = L"unknown command";
             pError->caretCol = 1 + (int)(wordStart - pCmd);
@@ -1534,8 +1720,7 @@ static BOOL ProcessCommandText(HWND hwnd, WCHAR* text, CommandError* pError)
         return FALSE;
     }
 
-    if (cmd.type == EXCMD_EDIT && !cmd.arg)
-    {
+    if (cmd.type == EXCMD_EDIT && !cmd.arg) {
         if (pError) {
             int caretCol = 1 + (int)(wordStart - pCmd) + cmdWordLen + (cmd.force ? 1 : 0);
             pError->message = L"file name required";
@@ -1612,7 +1797,7 @@ static LRESULT HandleChar(HWND hwnd, ViewState* pState, WPARAM wParam) {
         }
         
         // Skip control characters (Back, Enter, Esc) handled in WM_KEYDOWN
-        // We only want to capture printable text (ASCII 32 and above)
+        // We only want to capture printable characters (ASCII 32 and above)
         if (c < 32 || c == 127) return 0;
 
         // Append to the command buffer if there is space (leaving room for null terminator)
@@ -1629,6 +1814,7 @@ static LRESULT HandleChar(HWND hwnd, ViewState* pState, WPARAM wParam) {
             pState->commandLen++;
             pState->commandCaretPos++;
             pState->szCommandBuf[pState->commandLen] = L'\0';
+            pState->wrapCacheValid = FALSE;
             
             InvalidateRect(hwnd, NULL, TRUE);
             UpdateCaretPosition(hwnd, pState);
@@ -1649,6 +1835,7 @@ static LRESULT HandleChar(HWND hwnd, ViewState* pState, WPARAM wParam) {
         size_t selStart = 0, selLen = 0;
         if (View_GetSelection(pState, &selStart, &selLen)) {
             Doc_Delete(pState->pDoc, selStart, selLen);
+            pState->wrapCacheValid = FALSE;
             pState->cursorOffset = pState->selectionAnchor = selStart;
         } else if (!pState->bInsertMode && c != L'\n') {
             // Overtype logic: Remove the next character if we aren't at EOF
@@ -1658,12 +1845,14 @@ static LRESULT HandleChar(HWND hwnd, ViewState* pState, WPARAM wParam) {
                 // Don't overtype the newline; it preserves the document's line structure
                 if (nextChar != L'\n') {
                     Doc_Delete(pState->pDoc, pState->cursorOffset, 1);
+                    pState->wrapCacheValid = FALSE;
                 }
             }
         }
 
         // Insert the character and collapse the selection/anchor
         Doc_Insert(pState->pDoc, pState->cursorOffset, &c, 1);
+        pState->wrapCacheValid = FALSE;
         pState->cursorOffset++;
         pState->selectionAnchor = pState->cursorOffset;
 
@@ -1677,7 +1866,6 @@ static LRESULT HandleChar(HWND hwnd, ViewState* pState, WPARAM wParam) {
 
         UpdateCaretPosition(hwnd, pState);
         InvalidateRect(hwnd, NULL, TRUE);
-        UpdateWindow(hwnd); // Ensure immediate visual feedback
     }
     
     UpdateScrollbars(hwnd, pState);
@@ -1695,8 +1883,7 @@ static LRESULT HandleMouseWheel(HWND hwnd, ViewState* pState, WPARAM wParam) {
     GetClientRect(hwnd, &rc);
     int clientHeight = rc.bottom;
     
-    int wrapWidth = rc.right - 10;
-    int totalDocHeight = View_GetDocumentHeight(hwnd, pState, wrapWidth);
+    int totalDocHeight = View_GetDocumentHeight(hwnd, pState);
     
     // Determine the maximum scroll position
     int maxScroll = totalDocHeight - clientHeight;
@@ -1809,7 +1996,7 @@ static LRESULT HandleKeyDown(HWND hwnd, ViewState* pState, WPARAM wParam, LPARAM
         case 'X':
             if (isCtrlPressed) { View_Cut(hwnd); return 0; }
             break;
-        case 'C':
+		case 'C':
             if (isCtrlPressed) { View_Copy(hwnd); return 0; }
             break;
         case 'V':
@@ -1835,14 +2022,8 @@ static LRESULT HandleKeyDown(HWND hwnd, ViewState* pState, WPARAM wParam, LPARAM
             if (pState->bWordWrap) {
                 int x, y;
                 GetCursorVisualPos(hwnd, pState, pState->cursorOffset, &x, &y);
-                RECT rc;
-                GetClientRect(hwnd, &rc);
-                int wrapWidth = rc.right - 10;
-                int totalH = GetTotalWrappedHeight(hwnd, pState, wrapWidth);
                 int targetY = y - pState->lineHeight;
                 if (targetY < 0) targetY = 0;
-                int maxY = (totalH > pState->lineHeight) ? (totalH - pState->lineHeight) : 0;
-                if (targetY > maxY) targetY = maxY;
                 pState->cursorOffset = View_XYToOffset(hwnd, x, targetY);
             } else {
                 if (line > 1) {
@@ -1861,14 +2042,7 @@ static LRESULT HandleKeyDown(HWND hwnd, ViewState* pState, WPARAM wParam, LPARAM
             if (pState->bWordWrap) {
                 int x, y;
                 GetCursorVisualPos(hwnd, pState, pState->cursorOffset, &x, &y);
-                RECT rc;
-                GetClientRect(hwnd, &rc);
-                int wrapWidth = rc.right - 10;
-                int totalH = GetTotalWrappedHeight(hwnd, pState, wrapWidth);
                 int targetY = y + pState->lineHeight;
-                int maxY = (totalH > pState->lineHeight) ? (totalH - pState->lineHeight) : 0;
-                if (targetY < 0) targetY = 0;
-                if (targetY > maxY) targetY = maxY;
                 pState->cursorOffset = View_XYToOffset(hwnd, x, targetY);
             } else{
                 if (line < (int)pState->pDoc->line_count) {
@@ -1878,9 +2052,9 @@ static LRESULT HandleKeyDown(HWND hwnd, ViewState* pState, WPARAM wParam, LPARAM
                     size_t newCol = (col > (int)nextLen) ? nextLen : (size_t)col;
                     pState->cursorOffset = nextLineStart + (newCol > 0 ? newCol - 1 : 0);
                 }
-                if (!isShiftPressed) pState->selectionAnchor = pState->cursorOffset;
-                NotifyParent(hwnd, EN_SELCHANGE);
             }
+            if (!isShiftPressed) pState->selectionAnchor = pState->cursorOffset;
+            NotifyParent(hwnd, EN_SELCHANGE);
             break;
 
         case VK_HOME:
@@ -1905,15 +2079,18 @@ static LRESULT HandleKeyDown(HWND hwnd, ViewState* pState, WPARAM wParam, LPARAM
             size_t delStart = 0, delLen = 0;
             if (View_GetSelection(pState, &delStart, &delLen)) {
                 Doc_Delete(pState->pDoc, delStart, delLen);
+                pState->wrapCacheValid = FALSE;
                 pState->cursorOffset = pState->selectionAnchor = delStart;
                 NotifyParent(hwnd, EN_CHANGE);
             } else {
                 if (wParam == VK_BACK && pState->cursorOffset > 0) {
                     Doc_Delete(pState->pDoc, --pState->cursorOffset, 1);
+                    pState->wrapCacheValid = FALSE;
                     pState->selectionAnchor = pState->cursorOffset;
                     NotifyParent(hwnd, EN_CHANGE);
                 } else if (wParam == VK_DELETE && pState->cursorOffset < pState->pDoc->total_length) {
                     Doc_Delete(pState->pDoc, pState->cursorOffset, 1);
+                    pState->wrapCacheValid = FALSE;
                     NotifyParent(hwnd, EN_CHANGE);
                 }
             }
@@ -1925,6 +2102,9 @@ static LRESULT HandleKeyDown(HWND hwnd, ViewState* pState, WPARAM wParam, LPARAM
             pState->bInsertMode = !pState->bInsertMode;
             NotifyParent(hwnd, EN_SELCHANGE);
             break;
+        default:
+            SendMessage(GetParent(hwnd), WM_KEYDOWN, wParam, lParam);
+            return 0;
     }
     UpdateScrollbars(hwnd, pState);
     EnsureCursorVisible(hwnd, pState);
@@ -2113,10 +2293,9 @@ static LRESULT HandleVScroll(HWND hwnd, ViewState* pState, WPARAM wParam) {
     RECT rc;
     GetClientRect(hwnd, &rc);
     int clientHeight = rc.bottom;
-    int wrapWidth = rc.right - 10;
     
     // Calculate safe scroll bounds
-    int totalDocHeight = View_GetDocumentHeight(hwnd, pState, wrapWidth);
+    int totalDocHeight = View_GetDocumentHeight(hwnd, pState);
 
     int maxScroll = totalDocHeight - clientHeight;
     if (maxScroll < 0) maxScroll = 0;
@@ -2198,11 +2377,10 @@ static LRESULT HandleSize(HWND hwnd, ViewState* pState, WPARAM wParam, LPARAM lP
         if (pState->bWordWrap) {
             RECT rcSize;
             GetClientRect(hwnd, &rcSize);
-            int wrapWidth = rcSize.right - 10;
-            si.nMax = View_GetDocumentHeight(hwnd, pState, wrapWidth);
+            si.nMax = View_GetDocumentHeight(hwnd, pState);
             si.nPage = rcSize.bottom;
         } else {
-            si.nMax = View_GetDocumentHeight(hwnd, pState, 0);
+            si.nMax = View_GetDocumentHeight(hwnd, pState);
             si.nPage = HIWORD(lParam);
         }
         SetScrollInfo(hwnd, SB_VERT, &si, TRUE);
@@ -2302,6 +2480,7 @@ static LRESULT HandleLButtonDblClk(HWND hwnd, ViewState* pState, WPARAM wParam, 
 
 static LRESULT HandleDestroy(ViewState* pState) {
     if (pState->hCaretBm) DeleteObject(pState->hCaretBm);
+    if (pState->visualLines) free(pState->visualLines);
     DeleteObject(pState->hFont);
     free(pState);
     return 0;

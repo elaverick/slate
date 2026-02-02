@@ -30,6 +30,12 @@ This editor is intentionally simple. It’s designed to sit somewhere between a 
   - Whitespace display mode
 
 
+## Development process
+
+This project was developed experimentally with the assistance of AI coding tools.
+It reflects an iterative, exploratory process rather than strict manual authorship.
+The code is shared as-is, without claims of originality beyond its present form.
+
 ## Building
 
 To build the application, run the build script:

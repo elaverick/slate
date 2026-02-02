@@ -59,8 +59,9 @@ void      Doc_GetOffsetInfo(SlateDoc* doc, size_t offset, int* out_line, int* ou
 size_t    Doc_GetLineOffset(SlateDoc* doc, size_t lineIndex);
 BOOL      Doc_Insert(SlateDoc* doc, size_t offset, const WCHAR* text, size_t len);
 BOOL      Doc_Delete(SlateDoc* doc, size_t offset, size_t len);
-BOOL      Doc_Undo(SlateDoc* pDoc, size_t* outCursor);
-BOOL      Doc_Redo(SlateDoc* pDoc, size_t* outCursor);
+void      Doc_EnsureLineForIndex(SlateDoc* doc, size_t lineIndex);
+BOOL      Doc_Undo(SlateDoc* pDoc, size_t currentCursor, size_t* outCursor);
+BOOL      Doc_Redo(SlateDoc* pDoc, size_t currentCursor, size_t* outCursor);
 
 typedef enum {
     DOC_SEARCH_NO_PATTERN,

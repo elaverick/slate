@@ -20,8 +20,17 @@
 
 #define CARET_IDLE_TIMEOUT 12000 // ms before switching to idle caret animation
 
+typedef struct VisualLineInfo {
+    size_t logicalLine;      // Which logical line this belongs to
+    size_t startOffset;      // Start offset within the logical line
+    size_t length;           // Number of characters in this visual line
+    int yPosition;           // Y position in document space
+} VisualLineInfo;
+
 typedef struct {
     SlateDoc* pDoc;
+    size_t docGeneration;  // Track when document changes
+    size_t cachedDocGeneration;  // Track which doc the cache is for
     int scrollY;
     int scrollX;
     int lineHeight;
@@ -51,6 +60,12 @@ typedef struct {
     double animationTime; // Total elapsed time in milliseconds
     DWORD lastActivity;        // Timestamp of last key press
     int   caretX, caretY;      // Current position
+    // Manual wrap cache
+    VisualLineInfo* visualLines;
+    size_t visualLineCount;
+    size_t visualLineCapacity;
+    int cachedWrapWidth;
+    BOOL wrapCacheValid;
 } ViewState;
 
 // Register the custom "SlateView" window class
