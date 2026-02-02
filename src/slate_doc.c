@@ -483,22 +483,28 @@ size_t Doc_GetText(SlateDoc* doc, size_t offset, size_t len, WCHAR* dest) {
     Piece* curr = doc->head;
     size_t cumulative = 0;
     size_t destPos = 0;
+    size_t unitsConsumed = 0;
 
-    while (curr && destPos < len) {
+    while (curr && unitsConsumed < len) {
+        if (destPos >= len) break;
+
         if (offset < cumulative + curr->length) {
             size_t startInPiece = (offset > cumulative) ? (offset - cumulative) : 0;
             size_t takeFromPiece = curr->length - startInPiece;
-            if (takeFromPiece > (len - destPos)) takeFromPiece = (len - destPos);
+            size_t remaining = len - unitsConsumed;
+            if (takeFromPiece > remaining) takeFromPiece = remaining;
 
             if (curr->buffer == BUFFER_ORIGINAL && curr->isUtf8) {
                 // Convert UTF-8 on-the-fly for the view
-                MultiByteToWideChar(CP_UTF8, 0, ((char*)doc->original_buffer) + curr->start + startInPiece, 
-                                   (int)takeFromPiece, dest + destPos, (int)takeFromPiece);
+                int written = MultiByteToWideChar(CP_UTF8, 0, ((char*)doc->original_buffer) + curr->start + startInPiece, 
+                                   (int)takeFromPiece, dest + destPos, (int)(len - destPos));
+                if (written > 0) destPos += written;
             } else {
                 const WCHAR* src = (curr->buffer == BUFFER_ORIGINAL) ? (WCHAR*)doc->original_buffer : doc->add_buffer;
                 memcpy(dest + destPos, src + curr->start + startInPiece, takeFromPiece * sizeof(WCHAR));
+                destPos += takeFromPiece;
             }
-            destPos += takeFromPiece;
+            unitsConsumed += takeFromPiece;
         }
         cumulative += curr->length;
         curr = curr->next;

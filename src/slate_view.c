@@ -30,8 +30,8 @@ static BOOL View_LoadLine(ViewState* pState, size_t lineIdx, size_t* pLineStart,
     WCHAR* buf = malloc((len + 1) * sizeof(WCHAR));
     if (!buf) return FALSE;
 
-    Doc_GetText(pState->pDoc, lineStart, len, buf);
-    size_t trimmed = len;
+    size_t charsRead = Doc_GetText(pState->pDoc, lineStart, len, buf);
+    size_t trimmed = charsRead;
     while (trimmed > 0 && (buf[trimmed - 1] == L'\n' || buf[trimmed - 1] == L'\r')) trimmed--;
     buf[trimmed] = 0;
 
@@ -64,7 +64,15 @@ static void RebuildWrapCache(HWND hwnd, ViewState* pState) {
     if (pState->wrapCacheValid && 
         pState->cachedWrapWidth == wrapWidth &&
         pState->cachedDocGeneration == pState->docGeneration) {
-        return;  // Cache is still valid
+        
+        // Lazy line map check: if the document has discovered more lines since we cached,
+        // our "last line" (which previously contained the rest of the file) is now invalid.
+        if (pState->visualLineCount > 0) {
+            size_t lastCachedLogLine = pState->visualLines[pState->visualLineCount - 1].logicalLine;
+            if (lastCachedLogLine == pState->pDoc->line_count - 1) {
+                return;  // Cache is still valid
+            }
+        }
     }
 
     // Cache is invalid, rebuild it
@@ -113,7 +121,7 @@ static void RebuildWrapCache(HWND hwnd, ViewState* pState) {
 
             // Find how much text fits on this visual line
             size_t fitLen = 0;
-            size_t lastBreakPoint = 0;
+            size_t lastBreakPoint = pos;
 
             for (size_t i = pos; i < dLen; i++) {
                 WCHAR ch = buf[i];
@@ -122,7 +130,7 @@ static void RebuildWrapCache(HWND hwnd, ViewState* pState) {
                 int width = LOWORD(extent);
 
                 if (width > wrapWidth) {
-                    if (lastBreakPoint > pos) {
+                    if (lastBreakPoint > pos) { // Did we see a space/hyphen on this line?
                         fitLen = lastBreakPoint - pos;
                     } else if (fitLen > 0) {
                         fitLen = fitLen;
@@ -1171,6 +1179,12 @@ static void PaintWrappedContent(ViewState* pState, HDC memDC, RECT rc, int tabSt
 
         // Draw text for this visual line
         if (vLine->length > 0) {
+            // Safety: Ensure the visual line points to valid offsets in the current buffer
+            if (vLine->startOffset + vLine->length > dLen) {
+                free(buf);
+                continue;
+            }
+
             TabbedTextOutW(memDC, 5, yPos, buf + vLine->startOffset, (int)vLine->length, 1, &tabStops, 5);
 
             // Handle selection overlay
