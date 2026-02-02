@@ -121,34 +121,43 @@ static void RebuildWrapCache(HWND hwnd, ViewState* pState) {
 
             // Find how much text fits on this visual line
             size_t fitLen = 0;
-            size_t lastBreakPoint = pos;
+            size_t remaining = dLen - pos;
+            size_t low = 1;
+            size_t high = remaining;
+            size_t bestFit = 0;
 
-            for (size_t i = pos; i < dLen; i++) {
-                WCHAR ch = buf[i];
-                
-                DWORD extent = GetTabbedTextExtentW(hdc, buf + pos, (int)(i - pos + 1), 1, &tabStops);
+            // Binary search for the longest string that fits
+            while (low <= high) {
+                size_t mid = low + (high - low) / 2;
+                DWORD extent = GetTabbedTextExtentW(hdc, buf + pos, (int)mid, 1, &tabStops);
                 int width = LOWORD(extent);
 
-                if (width > wrapWidth) {
-                    if (lastBreakPoint > pos) { // Did we see a space/hyphen on this line?
-                        fitLen = lastBreakPoint - pos;
-                    } else if (fitLen > 0) {
-                        fitLen = fitLen;
-                    } else {
-                        fitLen = 1;
-                    }
-                    break;
-                }
-
-                fitLen = i - pos + 1;
-
-                if (ch == L' ' || ch == L'\t' || ch == L'-') {
-                    lastBreakPoint = i + 1;
+                if (width <= wrapWidth) {
+                    bestFit = mid;
+                    low = mid + 1;
+                } else {
+                    high = mid - 1;
                 }
             }
 
-            if (pos + fitLen >= dLen) {
-                fitLen = dLen - pos;
+            fitLen = bestFit;
+
+            // If we can't fit the rest of the line, we need to wrap
+            if (fitLen < remaining) {
+                // Scan backwards for a word boundary
+                BOOL foundBreak = FALSE;
+                for (size_t i = fitLen; i > 0; i--) {
+                    WCHAR ch = buf[pos + i - 1];
+                    if (ch == L' ' || ch == L'\t' || ch == L'-') {
+                        fitLen = i;
+                        foundBreak = TRUE;
+                        break;
+                    }
+                }
+                // If no boundary found, force break at the limit
+                if (!foundBreak && fitLen == 0) fitLen = 1;
+            } else {
+                fitLen = remaining;
             }
 
             // Skip leading spaces on wrapped lines
