@@ -211,15 +211,50 @@ static void Doc_EnsureLineMapUpTo(SlateDoc* doc, size_t targetOffset) {
     }
 }
 
-void Doc_RefreshMetadata(SlateDoc* pDoc) {
-    if (!pDoc) return;
-
-    // Recompute total length without scanning characters
+// Recomputes total_length by summing piece lengths. O(piece count); never
+// scans character data.
+static void Doc_RecalculateTotalLength(SlateDoc* pDoc) {
     size_t totalLen = 0;
     for (Piece* curr = pDoc->head; curr; curr = curr->next) {
         totalLen += curr->length;
     }
     pDoc->total_length = totalLen;
+}
+
+// Locates the piece and raw storage offset within it that correspond to
+// logical offset `target`, for resuming the lazy line scanner mid-document.
+static void Doc_LocateScanResumePoint(SlateDoc* pDoc, size_t target, Piece** outPiece, size_t* outPieceOffset) {
+    Piece* piece = pDoc->head;
+    size_t cumulative = 0;
+    while (piece && cumulative + piece->length <= target) {
+        cumulative += piece->length;
+        piece = piece->next;
+    }
+
+    *outPiece = piece;
+    if (!piece) {
+        *outPieceOffset = 0;
+        return;
+    }
+
+    size_t logicalIntoPiece = target - cumulative;
+    if (piece->buffer == BUFFER_ORIGINAL && piece->isUtf8) {
+        const unsigned char* buf = (const unsigned char*)pDoc->original_buffer;
+        size_t byteOff = Utf8ByteOffsetForUnits(buf, piece->start, piece->start + piece->rawLength, logicalIntoPiece, NULL);
+        *outPieceOffset = byteOff - piece->start;
+    } else {
+        *outPieceOffset = logicalIntoPiece;
+    }
+}
+
+// Full metadata refresh: recomputes total_length and resets the line map to
+// scratch (rescanned lazily from offset 0 on demand). Used whenever the
+// piece list may have changed in ways with no single "edit point" - initial
+// load and undo/redo, where the whole piece list is swapped wholesale.
+void Doc_RefreshMetadata(SlateDoc* pDoc) {
+    if (!pDoc) return;
+
+    Doc_RecalculateTotalLength(pDoc);
 
     // Reset line map storage
     if (pDoc->line_offsets) {
@@ -238,7 +273,7 @@ void Doc_RefreshMetadata(SlateDoc* pDoc) {
 
     pDoc->line_offsets[0] = 0;
     pDoc->line_count = 1;
-    pDoc->line_map_complete = (totalLen == 0);
+    pDoc->line_map_complete = (pDoc->total_length == 0);
     pDoc->line_scan_offset = 0;
     pDoc->line_scan_piece = pDoc->head;
     pDoc->line_scan_piece_offset = 0;
@@ -246,6 +281,47 @@ void Doc_RefreshMetadata(SlateDoc* pDoc) {
     if (pDoc->line_map_complete && pDoc->line_capacity > 1) {
         pDoc->line_offsets[1] = 0;
     }
+}
+
+// Incremental metadata refresh for a single edit (insert or delete) that
+// starts at `editOffset`. Recomputes total_length, but instead of throwing
+// away the whole line map, it only discards line-start entries at or after
+// the edit point (anything before is untouched by the edit) and resumes lazy
+// scanning from there. This keeps Doc_Insert/Doc_Delete - called on every
+// keystroke - from forcing an O(document size) rescan on every edit.
+static void Doc_RefreshMetadataFrom(SlateDoc* pDoc, size_t editOffset) {
+    if (!pDoc) return;
+
+    Doc_RecalculateTotalLength(pDoc);
+
+    if (!pDoc->line_offsets) {
+        Doc_RefreshMetadata(pDoc); // No map allocated yet - fall back to a full (cheap) reset
+        return;
+    }
+
+    // Binary search for the first cached line-start offset after editOffset;
+    // everything before that index remains valid and unchanged.
+    size_t lo = 0, hi = pDoc->line_count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (pDoc->line_offsets[mid] <= editOffset) lo = mid + 1;
+        else hi = mid;
+    }
+    pDoc->line_count = lo;
+
+    size_t resumeOffset = (lo > 0) ? pDoc->line_offsets[lo - 1] : 0;
+    if (resumeOffset > pDoc->total_length) resumeOffset = pDoc->total_length;
+
+    Piece* piece;
+    size_t pieceOffset;
+    Doc_LocateScanResumePoint(pDoc, resumeOffset, &piece, &pieceOffset);
+
+    pDoc->line_scan_offset = resumeOffset;
+    pDoc->line_scan_piece = piece;
+    pDoc->line_scan_piece_offset = pieceOffset;
+    // Left FALSE unconditionally: Doc_EnsureLineMapUpTo already sets this back
+    // to TRUE itself as soon as it discovers there's nothing left to scan.
+    pDoc->line_map_complete = FALSE;
 }
 
 Piece* ClonePieceList(Piece* head) {
@@ -501,8 +577,8 @@ BOOL Doc_Insert(SlateDoc* doc, size_t offset, const WCHAR* text, size_t len) {
         }
     }
 
-    // Update metadata and line map
-    Doc_RefreshMetadata(doc);
+    // Update metadata and line map (incrementally - only from the edit point onward)
+    Doc_RefreshMetadataFrom(doc, offset);
 
     return TRUE;
 }
@@ -547,9 +623,9 @@ BOOL Doc_Delete(SlateDoc* doc, size_t offset, size_t len) {
         }
     }
 
-    // Refresh metadata and line map
-    Doc_RefreshMetadata(doc);
-    
+    // Refresh metadata and line map (incrementally - only from the edit point onward)
+    Doc_RefreshMetadataFrom(doc, offset);
+
     return TRUE;
 }
 
