@@ -5,16 +5,79 @@
 #define LINE_MAP_GROW_STEP 1024
 #define LINE_SCAN_STEP_BYTES (64 * 1024)
 
-static Piece* CreatePiece(BufferType buffer, size_t start, size_t length, BOOL isUtf8) {
+static Piece* CreatePiece(BufferType buffer, size_t start, size_t length, size_t rawLength, BOOL isUtf8) {
     Piece* p = (Piece*)malloc(sizeof(Piece));
     if (p) {
         p->buffer = buffer;
         p->start = start;
         p->length = length;
+        p->rawLength = rawLength;
         p->isUtf8 = isUtf8;
         p->next = NULL;
     }
     return p;
+}
+
+// ------------------------------
+// UTF-8 <-> UTF-16 unit accounting
+//
+// Piece::length is always a count of logical UTF-16 code units (matching the
+// units the view, cursor, line map, and search all work in). For UTF-8
+// original pieces, the physical storage is raw bytes, so we need to walk the
+// byte stream ourselves to translate between "N logical units" and "N bytes".
+// A UTF-8 sequence of 1-3 bytes decodes to a single UTF-16 unit; a 4-byte
+// sequence encodes a codepoint above the BMP and decodes to a surrogate pair
+// (2 units).
+// ------------------------------
+
+// Inspects the UTF-8 sequence starting at buf[i] (bounded by limit) and
+// returns its byte length, storing the number of UTF-16 units it decodes to
+// in *outUnits. Malformed/stray bytes are treated as a single byte/unit so
+// callers always make forward progress.
+static int Utf8SeqInfo(const unsigned char* buf, size_t i, size_t limit, int* outUnits) {
+    unsigned char b0 = buf[i];
+    int seqLen;
+    int units = 1;
+
+    if (b0 < 0x80) {
+        seqLen = 1;
+    } else if ((b0 & 0xE0) == 0xC0) {
+        seqLen = 2;
+    } else if ((b0 & 0xF0) == 0xE0) {
+        seqLen = 3;
+    } else if ((b0 & 0xF8) == 0xF0) {
+        seqLen = 4;
+        units = 2; // Above the BMP -> encoded as a UTF-16 surrogate pair
+    } else {
+        seqLen = 1; // Stray continuation byte or invalid lead byte
+    }
+
+    if (i + (size_t)seqLen > limit) seqLen = (int)(limit - i); // Truncated at a piece boundary
+    if (seqLen < 1) seqLen = 1;
+
+    *outUnits = units;
+    return seqLen;
+}
+
+// Walks forward from byteStart (up to byteLimit), consuming up to maxUnits
+// logical UTF-16 units, and returns the byte offset reached. Never splits a
+// surrogate pair: if consuming the next character would overshoot maxUnits,
+// it stops before that character. *outUnits (optional) receives the number
+// of units actually consumed, which can be less than maxUnits if the piece
+// runs out of bytes, or if the target falls between the two halves of a
+// surrogate pair.
+static size_t Utf8ByteOffsetForUnits(const unsigned char* buf, size_t byteStart, size_t byteLimit, size_t maxUnits, size_t* outUnits) {
+    size_t i = byteStart;
+    size_t units = 0;
+    while (i < byteLimit && units < maxUnits) {
+        int u;
+        int seqLen = Utf8SeqInfo(buf, i, byteLimit, &u);
+        if (units + (size_t)u > maxUnits) break;
+        units += (size_t)u;
+        i += (size_t)seqLen;
+    }
+    if (outUnits) *outUnits = units;
+    return i;
 }
 
 static Piece* SplitPiece(SlateDoc* doc, size_t offset) {
@@ -28,14 +91,34 @@ static Piece* SplitPiece(SlateDoc* doc, size_t offset) {
         if (offset == cumulative) return curr;
 
         if (offset > cumulative && offset < cumulative + curr->length) {
-            size_t splitPoint = offset - cumulative;
-            
+            size_t splitPoint = offset - cumulative; // Logical (UTF-16 unit) offset into this piece
+
+            size_t secondStart, secondLength, secondRawLength, firstRawLength;
+
+            if (curr->buffer == BUFFER_ORIGINAL && curr->isUtf8) {
+                // Translate the logical split point into a byte offset within the raw UTF-8 storage
+                const unsigned char* buf = (const unsigned char*)doc->original_buffer;
+                size_t unitsConsumed = 0;
+                size_t byteOff = Utf8ByteOffsetForUnits(buf, curr->start, curr->start + curr->rawLength, splitPoint, &unitsConsumed);
+
+                firstRawLength = byteOff - curr->start;
+                secondStart = byteOff;
+                secondRawLength = curr->rawLength - firstRawLength;
+                secondLength = curr->length - unitsConsumed;
+                splitPoint = unitsConsumed; // May be smaller than requested if it would split a surrogate pair
+            } else {
+                secondStart = curr->start + splitPoint;
+                secondRawLength = curr->rawLength - splitPoint;
+                secondLength = curr->length - splitPoint;
+                firstRawLength = splitPoint;
+            }
+
             // Preserve encoding flag when splitting the piece
-            Piece* secondHalf = CreatePiece(curr->buffer, curr->start + splitPoint, 
-                                            curr->length - splitPoint, curr->isUtf8);
+            Piece* secondHalf = CreatePiece(curr->buffer, secondStart, secondLength, secondRawLength, curr->isUtf8);
             if (secondHalf) {
                 secondHalf->next = curr->next;
                 curr->length = splitPoint;
+                curr->rawLength = firstRawLength;
                 curr->next = secondHalf;
             }
             return secondHalf;
@@ -70,26 +153,33 @@ static void Doc_EnsureLineMapUpTo(SlateDoc* doc, size_t targetOffset) {
     size_t logical = doc->line_scan_offset;
 
     while (piece && logical <= targetOffset) {
-        if (pieceOff >= piece->length) {
+        if (pieceOff >= piece->rawLength) {
             piece = piece->next;
             pieceOff = 0;
             continue;
         }
 
         if (piece->buffer == BUFFER_ORIGINAL && piece->isUtf8) {
-            const char* buf = (const char*)doc->original_buffer;
+            // pieceOff is a BYTE offset here (raw UTF-8 storage), not a logical unit count
+            const unsigned char* buf = (const unsigned char*)doc->original_buffer;
             size_t idx = pieceOff;
-            while (idx < piece->length && logical <= targetOffset) {
-                if (buf[piece->start + idx] == '\n') {
+            size_t byteLimit = piece->start + piece->rawLength;
+            while (idx < piece->rawLength && logical <= targetOffset) {
+                size_t absIdx = piece->start + idx;
+                int units;
+                int seqLen = Utf8SeqInfo(buf, absIdx, byteLimit, &units);
+
+                // A newline is always a single-byte ASCII sequence
+                if (seqLen == 1 && buf[absIdx] == '\n') {
                     if (!Doc_GrowLineOffsets(doc, 1)) break;
                     doc->line_offsets[doc->line_count++] = logical + 1;
                 }
-                idx++;
-                logical++;
+                idx += (size_t)seqLen;
+                logical += (size_t)units;
             }
             pieceOff = idx;
         } else {
-            const WCHAR* buf = (piece->buffer == BUFFER_ORIGINAL) ? 
+            const WCHAR* buf = (piece->buffer == BUFFER_ORIGINAL) ?
                                (WCHAR*)doc->original_buffer : doc->add_buffer;
             size_t idx = pieceOff;
             while (idx < piece->length && logical <= targetOffset) {
@@ -103,7 +193,7 @@ static void Doc_EnsureLineMapUpTo(SlateDoc* doc, size_t targetOffset) {
             pieceOff = idx;
         }
 
-        if (pieceOff >= piece->length) {
+        if (pieceOff >= piece->rawLength) {
             piece = piece->next;
             pieceOff = 0;
         }
@@ -328,7 +418,15 @@ SlateDoc* Doc_CreateFromMap(void* pMappedText, size_t len, HANDLE hMap, void* pB
     doc->add_capacity = 8192;
     doc->add_buffer = (WCHAR*)malloc(doc->add_capacity * sizeof(WCHAR));
 
-    doc->head = CreatePiece(BUFFER_ORIGINAL, 0, len, isUtf8);
+    // For UTF-8, `len` is the raw byte count; the piece's LOGICAL length (in UTF-16
+    // units, as used by every offset calculation elsewhere) must be decoded up front.
+    size_t logicalLen = len;
+    if (isUtf8 && len > 0) {
+        int units = MultiByteToWideChar(CP_UTF8, 0, (const char*)pMappedText, (int)len, NULL, 0);
+        logicalLen = (units > 0) ? (size_t)units : 0;
+    }
+
+    doc->head = CreatePiece(BUFFER_ORIGINAL, 0, logicalLen, len, isUtf8);
 
     Doc_RefreshMetadata(doc);
     return doc;
@@ -377,50 +475,29 @@ BOOL Doc_Insert(SlateDoc* doc, size_t offset, const WCHAR* text, size_t len) {
     memcpy(doc->add_buffer + add_start_index, text, len * sizeof(WCHAR));
     doc->add_len += len;
 
-    // Insert a new piece into the table
-    if (offset == 0) {
-        // Insert at very beginning
-        // All new additions are UTF-16, so isUtf8 is FALSE
-        Piece* newP = CreatePiece(BUFFER_ADD, add_start_index, len, FALSE);
-        newP->next = doc->head;
-        doc->head = newP;
-    } else if (offset == doc->total_length) {
-        // Append to very end
+    // Insert a new piece into the table. All new additions are UTF-16, so isUtf8 is FALSE
+    // and length == rawLength (both counted in WCHAR units).
+    Piece* newP = CreatePiece(BUFFER_ADD, add_start_index, len, len, FALSE);
+
+    if (offset == doc->total_length) {
+        // Append to very end (also handles the empty-document case)
         Piece* curr = doc->head;
         while (curr && curr->next) curr = curr->next;
-        Piece* newP = CreatePiece(BUFFER_ADD, add_start_index, len, FALSE);
         if (curr) curr->next = newP;
         else doc->head = newP;
     } else {
-        Piece* curr = doc->head;
-        size_t cumulative = 0;
-
-        while (curr) {
-            if (offset > cumulative && offset < cumulative + curr->length) {
-                // Split this piece in two
-                size_t splitPoint = offset - cumulative;
-                
-                // The split pieces maintain the encoding of the original piece (curr->isUtf8)
-                Piece* secondHalf = CreatePiece(curr->buffer, curr->start + splitPoint, curr->length - splitPoint, curr->isUtf8);
-                secondHalf->next = curr->next;
-
-                // Create the new text piece (always UTF-16)
-                Piece* newP = CreatePiece(BUFFER_ADD, add_start_index, len, FALSE);
-                newP->next = secondHalf;
-
-                // Link the first half to the new piece
-                curr->length = splitPoint;
-                curr->next = newP;
-                break;
-            } else if (offset == cumulative + curr->length) {
-                // Lucky break: Insert exactly between two existing pieces
-                Piece* newP = CreatePiece(BUFFER_ADD, add_start_index, len, FALSE);
-                newP->next = curr->next;
-                curr->next = newP;
-                break;
-            }
-            cumulative += curr->length;
-            curr = curr->next;
+        // SplitPiece guarantees a piece boundary starts exactly at `offset`,
+        // splitting an existing piece if needed (encoding-aware for UTF-8 pieces).
+        Piece* after = SplitPiece(doc, offset);
+        if (after == doc->head) {
+            // offset == 0, or the split landed at the very first piece
+            newP->next = doc->head;
+            doc->head = newP;
+        } else {
+            Piece* prev = doc->head;
+            while (prev && prev->next != after) prev = prev->next;
+            if (prev) prev->next = newP;
+            newP->next = after;
         }
     }
 
@@ -495,16 +572,30 @@ size_t Doc_GetText(SlateDoc* doc, size_t offset, size_t len, WCHAR* dest) {
             if (takeFromPiece > remaining) takeFromPiece = remaining;
 
             if (curr->buffer == BUFFER_ORIGINAL && curr->isUtf8) {
-                // Convert UTF-8 on-the-fly for the view
-                int written = MultiByteToWideChar(CP_UTF8, 0, ((char*)doc->original_buffer) + curr->start + startInPiece, 
-                                   (int)takeFromPiece, dest + destPos, (int)(len - destPos));
-                if (written > 0) destPos += written;
+                // startInPiece/takeFromPiece are logical (UTF-16) units; translate them
+                // into a byte range within the raw UTF-8 storage before decoding.
+                const unsigned char* buf = (const unsigned char*)doc->original_buffer;
+                size_t byteStart = Utf8ByteOffsetForUnits(buf, curr->start, curr->start + curr->rawLength, startInPiece, NULL);
+                size_t byteEnd = Utf8ByteOffsetForUnits(buf, byteStart, curr->start + curr->rawLength, takeFromPiece, NULL);
+
+                int written = 0;
+                if (byteEnd > byteStart) {
+                    written = MultiByteToWideChar(CP_UTF8, 0, (const char*)buf + byteStart,
+                                       (int)(byteEnd - byteStart), dest + destPos, (int)(len - destPos));
+                }
+                // Advance both counters by the SAME (actual) amount so they never desync.
+                if (written > 0) {
+                    destPos += written;
+                    unitsConsumed += written;
+                } else {
+                    unitsConsumed += takeFromPiece;
+                }
             } else {
                 const WCHAR* src = (curr->buffer == BUFFER_ORIGINAL) ? (WCHAR*)doc->original_buffer : doc->add_buffer;
                 memcpy(dest + destPos, src + curr->start + startInPiece, takeFromPiece * sizeof(WCHAR));
                 destPos += takeFromPiece;
+                unitsConsumed += takeFromPiece;
             }
-            unitsConsumed += takeFromPiece;
         }
         cumulative += curr->length;
         curr = curr->next;
@@ -567,8 +658,9 @@ void Doc_GetOffsetInfo(SlateDoc* doc, size_t offset, int* out_line, int* out_col
 
 typedef struct {
     Piece* piece;
-    size_t pieceOffset;
+    size_t pieceOffset;   // Raw storage offset within the piece (bytes for UTF-8 original pieces, WCHAR units otherwise)
     size_t logicalOffset;
+    WCHAR  pendingLow;    // Queued low surrogate from a just-decoded astral character, or 0
 } DocCharIterator;
 
 static WCHAR FoldAscii(WCHAR ch, BOOL caseSensitive) {
@@ -588,35 +680,78 @@ static BOOL DocIter_Seek(SlateDoc* doc, size_t targetOffset, DocCharIterator* it
     }
 
     it->piece = curr;
-    it->pieceOffset = curr ? (targetOffset - cumulative) : 0;
     it->logicalOffset = targetOffset;
+    it->pendingLow = 0;
+
+    if (curr) {
+        size_t logicalIntoPiece = targetOffset - cumulative;
+        if (curr->buffer == BUFFER_ORIGINAL && curr->isUtf8) {
+            const unsigned char* buf = (const unsigned char*)doc->original_buffer;
+            size_t byteOff = Utf8ByteOffsetForUnits(buf, curr->start, curr->start + curr->rawLength, logicalIntoPiece, NULL);
+            it->pieceOffset = byteOff - curr->start;
+        } else {
+            it->pieceOffset = logicalIntoPiece;
+        }
+    } else {
+        it->pieceOffset = 0;
+    }
     return TRUE;
 }
 
-static WCHAR Doc_ReadChar(const SlateDoc* doc, const Piece* piece, size_t pieceOffset) {
-    if (!doc || !piece) return 0;
+static BOOL DocIter_Next(SlateDoc* doc, DocCharIterator* it, WCHAR* outChar) {
+    if (!doc || !it) return FALSE;
+
+    // Emit a queued low surrogate before anything else; this doesn't consume
+    // any more raw storage, but the piece it came from may now be exhausted.
+    if (it->pendingLow) {
+        *outChar = it->pendingLow;
+        it->pendingLow = 0;
+        it->logicalOffset++;
+        if (it->piece && it->pieceOffset >= it->piece->rawLength) {
+            it->piece = it->piece->next;
+            it->pieceOffset = 0;
+        }
+        return TRUE;
+    }
+
+    if (!it->piece) return FALSE;
+    Piece* piece = it->piece;
 
     if (piece->buffer == BUFFER_ORIGINAL && piece->isUtf8) {
         const unsigned char* buf = (const unsigned char*)doc->original_buffer;
-        return (WCHAR)buf[piece->start + pieceOffset];
+        size_t idx = piece->start + it->pieceOffset;
+        size_t byteLimit = piece->start + piece->rawLength;
+
+        int units;
+        int seqLen = Utf8SeqInfo(buf, idx, byteLimit, &units);
+
+        WCHAR wbuf[2] = { 0, 0 };
+        int written = MultiByteToWideChar(CP_UTF8, 0, (const char*)buf + idx, seqLen, wbuf, 2);
+        if (written <= 0) {
+            wbuf[0] = (WCHAR)buf[idx]; // Malformed byte - fall back to a literal unit so we still progress
+            written = 1;
+        }
+
+        *outChar = wbuf[0];
+        it->pieceOffset += (size_t)seqLen;
+
+        if (written > 1) {
+            it->pendingLow = wbuf[1]; // Piece-advance is deferred until this is consumed
+        } else if (it->pieceOffset >= piece->rawLength) {
+            it->piece = piece->next;
+            it->pieceOffset = 0;
+        }
+    } else {
+        const WCHAR* buf = (piece->buffer == BUFFER_ORIGINAL) ? (WCHAR*)doc->original_buffer : doc->add_buffer;
+        *outChar = buf ? buf[piece->start + it->pieceOffset] : 0;
+        it->pieceOffset++;
+        if (it->pieceOffset >= piece->length) {
+            it->piece = piece->next;
+            it->pieceOffset = 0;
+        }
     }
 
-    const WCHAR* buf = (piece->buffer == BUFFER_ORIGINAL) ? (WCHAR*)doc->original_buffer : doc->add_buffer;
-    return buf ? buf[piece->start + pieceOffset] : 0;
-}
-
-static BOOL DocIter_Next(SlateDoc* doc, DocCharIterator* it, WCHAR* outChar) {
-    if (!doc || !it || !it->piece) return FALSE;
-
-    *outChar = Doc_ReadChar(doc, it->piece, it->pieceOffset);
-
-    // Advance iterator
     it->logicalOffset++;
-    it->pieceOffset++;
-    if (it->pieceOffset >= it->piece->length) {
-        it->piece = it->piece->next;
-        it->pieceOffset = 0;
-    }
     return TRUE;
 }
 

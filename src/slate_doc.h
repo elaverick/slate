@@ -7,8 +7,9 @@ typedef enum { BUFFER_ORIGINAL, BUFFER_ADD } BufferType;
 
 typedef struct Piece {
     BufferType buffer;
-    size_t start;
-    size_t length;
+    size_t start;      // Index into the piece's storage buffer (bytes for UTF-8 original pieces, WCHAR units otherwise)
+    size_t length;      // LOGICAL length in UTF-16 code units - the unit used for all document/cursor offset math
+    size_t rawLength;   // Physical length in the storage buffer (bytes for UTF-8 original pieces, equal to length otherwise)
     BOOL isUtf8;       // TRUE for original UTF-8 pieces, FALSE for ADD buffer text (always UTF-16)
     struct Piece* next;
 } Piece;
