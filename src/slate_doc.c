@@ -551,28 +551,44 @@ BOOL Doc_Insert(SlateDoc* doc, size_t offset, const WCHAR* text, size_t len) {
     memcpy(doc->add_buffer + add_start_index, text, len * sizeof(WCHAR));
     doc->add_len += len;
 
-    // Insert a new piece into the table. All new additions are UTF-16, so isUtf8 is FALSE
-    // and length == rawLength (both counted in WCHAR units).
-    Piece* newP = CreatePiece(BUFFER_ADD, add_start_index, len, len, FALSE);
-
     if (offset == doc->total_length) {
         // Append to very end (also handles the empty-document case)
         Piece* curr = doc->head;
         while (curr && curr->next) curr = curr->next;
-        if (curr) curr->next = newP;
-        else doc->head = newP;
+
+        // If the trailing piece is an ADD piece whose stored range ends exactly
+        // where we just appended, extend it in place instead of allocating a new
+        // node - this is the common case of typing forward continuously, and
+        // keeps piece count (and everything that walks it) from growing by one
+        // node per keystroke.
+        if (curr && curr->buffer == BUFFER_ADD && curr->start + curr->rawLength == add_start_index) {
+            curr->length += len;
+            curr->rawLength += len;
+        } else {
+            Piece* newP = CreatePiece(BUFFER_ADD, add_start_index, len, len, FALSE);
+            if (curr) curr->next = newP;
+            else doc->head = newP;
+        }
     } else {
         // SplitPiece guarantees a piece boundary starts exactly at `offset`,
         // splitting an existing piece if needed (encoding-aware for UTF-8 pieces).
         Piece* after = SplitPiece(doc, offset);
-        if (after == doc->head) {
-            // offset == 0, or the split landed at the very first piece
-            newP->next = doc->head;
-            doc->head = newP;
-        } else {
-            Piece* prev = doc->head;
+        Piece* prev = NULL;
+        if (after != doc->head) {
+            prev = doc->head;
             while (prev && prev->next != after) prev = prev->next;
+        }
+
+        // Same in-place extension as above, but for typing in the middle of a
+        // document: the piece immediately preceding the cursor is the one most
+        // recently typed, and repeated keystrokes land right after it.
+        if (prev && prev->buffer == BUFFER_ADD && prev->start + prev->rawLength == add_start_index) {
+            prev->length += len;
+            prev->rawLength += len;
+        } else {
+            Piece* newP = CreatePiece(BUFFER_ADD, add_start_index, len, len, FALSE);
             if (prev) prev->next = newP;
+            else doc->head = newP;
             newP->next = after;
         }
     }
