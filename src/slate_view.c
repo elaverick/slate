@@ -24,8 +24,10 @@ static BOOL View_LoadLine(ViewState* pState, size_t lineIdx, size_t* pLineStart,
     if (!pState || !pState->pDoc || !ppBuf || !pTrimLen) return FALSE;
 
     size_t lineStart = Doc_GetLineOffset(pState->pDoc, lineIdx);
-    size_t lineEnd = (lineIdx + 1 < pState->pDoc->line_count) ? 
-                     Doc_GetLineOffset(pState->pDoc, lineIdx + 1) : pState->pDoc->total_length;
+    // Doc_GetLineOffset extends the lazy line map as needed (and returns total_length past
+    // the last line). Don't test line_count first: while the map is still partial, that
+    // would treat the rest of the document as part of this line.
+    size_t lineEnd = Doc_GetLineOffset(pState->pDoc, lineIdx + 1);
     size_t len = lineEnd - lineStart;
     WCHAR* buf = malloc((len + 1) * sizeof(WCHAR));
     if (!buf) return FALSE;
@@ -42,23 +44,108 @@ static BOOL View_LoadLine(ViewState* pState, size_t lineIdx, size_t* pLineStart,
     return TRUE;
 }
 
-// Mark a range of logical lines as needing re-wrap
-static void View_NotifyContentChange(ViewState* pState, size_t startLine, long lineCountDelta) {
+// Index of the first visual line belonging to logical line logLine (or later)
+static size_t View_FirstVisualLineForLogical(const ViewState* pState, size_t logLine) {
+    size_t lo = 0, hi = pState->visualLineCount;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (pState->visualLines[mid].logicalLine < logLine) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+// Index of the last visual line starting at or above document Y coordinate yDoc
+static size_t View_VisualLineAtY(const ViewState* pState, int yDoc) {
+    size_t lo = 0, hi = pState->visualLineCount;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (pState->visualLines[mid].yPosition <= yDoc) lo = mid + 1;
+        else hi = mid;
+    }
+    return (lo > 0) ? lo - 1 : 0;
+}
+
+// Forces the next RebuildWrapCache to do a full rebuild
+static void View_InvalidateWrapCache(ViewState* pState) {
+    if (!pState) return;
+    pState->wrapCacheValid = FALSE;
+    pState->firstDirtyLine = SIZE_MAX;
+    pState->dirtyLineDelta = 0;
+}
+
+// Records an edit for incremental re-wrapping: in the document's current line numbering,
+// lines [startLine, startLine + removedNewlines] were replaced by
+// [startLine, startLine + addedNewlines]. Edits accumulate until the next rebuild.
+static void View_NotifyContentChange(ViewState* pState, size_t startLine, long removedNewlines, long addedNewlines) {
     if (!pState) return;
 
-    // If we're already set for a full rebuild (SIZE_MAX), don't bother tracking details
-    if (pState->firstDirtyLine == SIZE_MAX) return;
+    // A full rebuild is already pending - nothing to track
+    if (!pState->wrapCacheValid && pState->firstDirtyLine == SIZE_MAX) return;
 
-    // Update the dirty start line (min of current and new)
-    if (startLine < pState->firstDirtyLine) {
+    size_t currentEnd = startLine + (size_t)removedNewlines + 1;
+    if (pState->firstDirtyLine == SIZE_MAX) {
         pState->firstDirtyLine = startLine;
+        pState->dirtyOldEndLine = currentEnd;
+        pState->dirtyLineDelta = 0;
+    } else {
+        // Merge with the pending range. Lines before firstDirtyLine are numbered the same in
+        // both schemes; lines after the pending range are offset by dirtyLineDelta. Taking
+        // the union can include a few unchanged lines in between, which is harmless.
+        if (startLine < pState->firstDirtyLine) pState->firstDirtyLine = startLine;
+        long long oldEquivEnd = (long long)currentEnd - pState->dirtyLineDelta;
+        if (oldEquivEnd > (long long)pState->dirtyOldEndLine) pState->dirtyOldEndLine = (size_t)oldEquivEnd;
     }
-
-    // Accumulate the line count delta
-    pState->dirtyLineDelta += lineCountDelta;
-
-    // Invalidate the validity flag so next paint triggers rebuild
+    pState->dirtyLineDelta += addedNewlines - removedNewlines;
     pState->wrapCacheValid = FALSE;
+}
+
+// Counts newlines in [start, start + len) of the document
+static long View_CountNewlines(SlateDoc* pDoc, size_t start, size_t len) {
+    WCHAR tmp[4096];
+    long count = 0;
+    while (len > 0) {
+        size_t chunk = (len > 4096) ? 4096 : len;
+        size_t got = Doc_GetText(pDoc, start, chunk, tmp);
+        if (got == 0) break;
+        for (size_t i = 0; i < got; i++) if (tmp[i] == L'\n') count++;
+        start += got;
+        len = (got < len) ? len - got : 0;
+    }
+    return count;
+}
+
+static void View_GrowDocWidthForLine(HWND hwnd, ViewState* pState, size_t lineIndex);
+
+// Deletes [start, start + len) and keeps the wrap and doc-width caches in step
+static BOOL View_DeleteRange(HWND hwnd, ViewState* pState, size_t start, size_t len) {
+    int line, col;
+    Doc_GetOffsetInfo(pState->pDoc, start, &line, &col);
+    size_t startLine = (line > 0) ? (size_t)(line - 1) : 0;
+    long removed = View_CountNewlines(pState->pDoc, start, len);
+
+    if (!Doc_Delete(pState->pDoc, start, len)) return FALSE;
+
+    View_NotifyContentChange(pState, startLine, removed, 0);
+    // Deleting only narrows lines, unless it joins two lines into one wider line
+    if (removed > 0) View_GrowDocWidthForLine(hwnd, pState, startLine);
+    return TRUE;
+}
+
+// Inserts text at offset and keeps the wrap and doc-width caches in step
+static BOOL View_InsertText(HWND hwnd, ViewState* pState, size_t offset, const WCHAR* text, size_t len) {
+    int line, col;
+    Doc_GetOffsetInfo(pState->pDoc, offset, &line, &col);
+    size_t startLine = (line > 0) ? (size_t)(line - 1) : 0;
+    long added = 0;
+    for (size_t i = 0; i < len; i++) if (text[i] == L'\n') added++;
+
+    if (!Doc_Insert(pState->pDoc, offset, text, len)) return FALSE;
+
+    View_NotifyContentChange(pState, startLine, 0, added);
+    // Only the lines the text landed on can have got wider
+    for (long i = 0; i <= added; i++) View_GrowDocWidthForLine(hwnd, pState, startLine + (size_t)i);
+    return TRUE;
 }
 
 // Rebuild the visual line cache for wrapped display (Supports Incremental)
@@ -82,17 +169,20 @@ static void RebuildWrapCache(HWND hwnd, ViewState* pState) {
     int wrapWidth = clientRect.right - 10;
     if (wrapWidth < 10) wrapWidth = 10;
 
+    // Wrapping needs every logical line, so make sure the lazy line map is complete.
+    // This is a one-off scan: edits keep the map complete by shifting it in place.
+    Doc_EnsureLineForIndex(pState->pDoc, SIZE_MAX);
+
+    BOOL sameLayout = (pState->cachedWrapWidth == wrapWidth) &&
+                      (pState->cachedDocGeneration == pState->docGeneration) &&
+                      (pState->visualLines != NULL) &&
+                      (pState->visualLineCount > 0);
+
     // 1. Validation Check: If everything matches, we are good.
-    if (pState->wrapCacheValid && 
-        pState->cachedWrapWidth == wrapWidth &&
-        pState->cachedDocGeneration == pState->docGeneration) {
-        
-        // Lazy check for appended lines (common when loading/tailing)
-        if (pState->visualLineCount > 0) {
-            size_t lastCachedLogLine = pState->visualLines[pState->visualLineCount - 1].logicalLine;
-            if (lastCachedLogLine == pState->pDoc->line_count - 1) {
-                return; // Cache is fully valid
-            }
+    if (pState->wrapCacheValid && sameLayout) {
+        size_t lastCachedLogLine = pState->visualLines[pState->visualLineCount - 1].logicalLine;
+        if (lastCachedLogLine == pState->pDoc->line_count - 1) {
+            return; // Cache is fully valid
         }
     }
 
@@ -103,13 +193,7 @@ static void RebuildWrapCache(HWND hwnd, ViewState* pState) {
     int tabStops = tm.tmAveCharWidth * 4;
 
     // 2. Decide Strategy: Incremental vs Full
-    BOOL isIncremental = (pState->cachedWrapWidth == wrapWidth) && 
-                         (pState->firstDirtyLine != SIZE_MAX) &&
-                         (pState->visualLines != NULL) &&
-                         (pState->visualLineCount > 0);
-
-    // If the cache was totally invalid (e.g. resize), force full rebuild
-    if (pState->cachedWrapWidth != wrapWidth) isIncremental = FALSE;
+    BOOL isIncremental = sameLayout && !pState->wrapCacheValid && (pState->firstDirtyLine != SIZE_MAX);
 
     // Setup range to process
     size_t startLogLine = 0;
@@ -132,20 +216,11 @@ static void RebuildWrapCache(HWND hwnd, ViewState* pState) {
         startLogLine = pState->firstDirtyLine;
         shiftDelta = pState->dirtyLineDelta;
 
-        // Calculate how many logical lines we are replacing (from the OLD state)
-        // If delta > 0 (lines added), we are replacing 1 old line with (1+delta) new lines.
-        // If delta < 0 (lines removed), we are replacing (1+abs(delta)) old lines with 1 new line.
-        // Wait, if we edit line 5, and insert newline, we re-wrap line 5 and 6.
-        // Let's keep it simple: We re-wrap from startLogLine to startLogLine + (1 + max(0, delta)).
-        // We stop re-wrapping when we hit a logical line that hasn't changed? 
-        // No, we rely on the caller to tell us the delta.
-        // We re-wrap the *entire affected logical block*.
-        
-        // The number of NEW logical lines to verify/wrap is:
-        size_t linesToWrap = 1; 
-        if (shiftDelta > 0) linesToWrap += shiftDelta;
-        
-        endLogLine = startLogLine + linesToWrap;
+        // Old logical lines [firstDirtyLine, dirtyOldEndLine) are replaced by new lines
+        // [firstDirtyLine, dirtyOldEndLine + delta); see View_NotifyContentChange.
+        long long newEnd = (long long)pState->dirtyOldEndLine + shiftDelta;
+        if (newEnd < (long long)startLogLine) newEnd = (long long)startLogLine;
+        endLogLine = (size_t)newEnd;
         if (endLogLine > pState->pDoc->line_count) endLogLine = pState->pDoc->line_count;
 
         // 1. Find where to start in visualLines (Binary Search)
@@ -168,10 +243,8 @@ static void RebuildWrapCache(HWND hwnd, ViewState* pState) {
             currentY = prev->yPosition + pState->lineHeight;
         }
 
-        // 3. Find end of removal range
-        // The old logical range was [startLogLine, startLogLine + 1 - min(0, delta)]
-        size_t oldLogRangeEnd = startLogLine + 1;
-        if (shiftDelta < 0) oldLogRangeEnd += (-shiftDelta);
+        // 3. Find end of removal range (old logical lines up to dirtyOldEndLine)
+        size_t oldLogRangeEnd = pState->dirtyOldEndLine;
 
         removeEndIdx = removeStartIdx;
         while (removeEndIdx < pState->visualLineCount && 
@@ -325,6 +398,7 @@ static void RebuildWrapCache(HWND hwnd, ViewState* pState) {
 
         // Fixup tail (logical indices and Y positions)
         size_t tailStart = removeEndIdx + visualCountDelta;
+        if (shiftDelta == 0 && yShift == 0) tailStart = pState->visualLineCount; // Nothing moved
         for (size_t i = tailStart; i < pState->visualLineCount; i++) {
             pState->visualLines[i].logicalLine += shiftDelta;
             pState->visualLines[i].yPosition += yShift;
@@ -410,8 +484,11 @@ static int View_ScanDocumentWidth(HWND hwnd, ViewState* pState) {
     GetTextMetrics(hdc, &tm);
     int tabStops = tm.tmAveCharWidth * 4;
 
+    // Only the lines indexed so far: snapshot the count, since View_LoadLine extends the
+    // lazy line map as it goes and would otherwise drag this loop through the whole file.
     int maxWidth = 0;
-    for (size_t i = 0; i < pState->pDoc->line_count; i++) {
+    size_t lineCount = pState->pDoc->line_count;
+    for (size_t i = 0; i < lineCount; i++) {
         WCHAR* buf = NULL;
         size_t dLen = 0;
         if (!View_LoadLine(pState, i, NULL, NULL, &buf, &dLen)) continue;
@@ -609,10 +686,11 @@ static void GetCursorVisualPos(HWND hwnd, ViewState* pState, size_t targetOffset
         size_t relOffset = targetOffset - lineStart;
 
         // Find which visual line contains this offset
-        for (size_t i = 0; i < pState->visualLineCount; i++) {
+        for (size_t i = View_FirstVisualLineForLogical(pState, logLine);
+             i < pState->visualLineCount && pState->visualLines[i].logicalLine == logLine; i++) {
             VisualLineInfo* vLine = &pState->visualLines[i];
-            
-            if (vLine->logicalLine == logLine &&
+
+            if (
                 relOffset >= vLine->startOffset &&
                 relOffset <= vLine->startOffset + vLine->length) {
                 
@@ -701,12 +779,11 @@ size_t View_XYToOffset(HWND hwnd, int targetX, int targetY) {
 
         // Find which visual line was clicked
         VisualLineInfo* targetVLine = NULL;
-        for (size_t i = 0; i < pState->visualLineCount; i++) {
-            VisualLineInfo* vLine = &pState->visualLines[i];
-            if (targetYDoc >= vLine->yPosition && 
+        {
+            VisualLineInfo* vLine = &pState->visualLines[View_VisualLineAtY(pState, targetYDoc)];
+            if (targetYDoc >= vLine->yPosition &&
                 targetYDoc < vLine->yPosition + pState->lineHeight) {
                 targetVLine = vLine;
-                break;
             }
         }
 
@@ -950,6 +1027,20 @@ void View_SetDocument(HWND hwnd, SlateDoc* pDoc) {
     ViewState* pState = GetState(hwnd);
     if (pState) {
         pState->pDoc = pDoc;
+
+        // Word wrap lays out the whole document up front, which is impractical for very
+        // large files (time, memory, and 32-bit pixel positions). Hold wrap off for such a
+        // document, and restore it automatically when a normal-sized one replaces it.
+        BOOL tooLarge = pDoc && pDoc->total_length > VIEW_MAX_WRAP_UNITS;
+        pState->bWrapAllowed = !tooLarge;
+        if (tooLarge && pState->bWordWrap) {
+            pState->bWordWrap = FALSE;
+            pState->bWrapSuppressed = TRUE;
+        } else if (!tooLarge && pState->bWrapSuppressed) {
+            pState->bWordWrap = TRUE;
+            pState->bWrapSuppressed = FALSE;
+        }
+
         pState->cursorOffset = 0;
         pState->scrollY = 0;
         pState->scrollX = 0;
@@ -1172,8 +1263,9 @@ void View_Undo(HWND hwnd) {
     if (Doc_Undo(pState->pDoc, pState->cursorOffset, &restoredCursor)) {
         pState->cursorOffset = restoredCursor;
         pState->selectionAnchor = restoredCursor;
-        // The whole piece list was swapped wholesale - any line could have changed width.
+        // The whole piece list was swapped wholesale - any line could have changed.
         pState->docWidthValid = FALSE;
+        View_InvalidateWrapCache(pState);
 
         // Ensure the screen follows the cursor after the undo
         EnsureCursorVisible(hwnd, pState);
@@ -1190,8 +1282,9 @@ void View_Redo(HWND hwnd) {
     if (Doc_Redo(pState->pDoc, pState->cursorOffset, &restoredCursor)) {
         pState->cursorOffset = restoredCursor;
         pState->selectionAnchor = restoredCursor;
-        // The whole piece list was swapped wholesale - any line could have changed width.
+        // The whole piece list was swapped wholesale - any line could have changed.
         pState->docWidthValid = FALSE;
+        View_InvalidateWrapCache(pState);
 
         // Ensure the screen follows the cursor after the redo
         EnsureCursorVisible(hwnd, pState);
@@ -1239,9 +1332,8 @@ void View_Cut(HWND hwnd) {
     // Copy the selection to the clipboard
     View_Copy(hwnd);
 
-    Doc_Delete(pState->pDoc, start, len);
-    pState->wrapCacheValid = FALSE;
-    
+    View_DeleteRange(hwnd, pState, start, len);
+
     // Collapse selection and update the view
     pState->cursorOffset = pState->selectionAnchor = start;
     NotifyParent(hwnd, EN_CHANGE);
@@ -1260,19 +1352,13 @@ void View_Paste(HWND hwnd) {
                 // If there is a selection, delete it first
                 size_t start = 0, len = 0;
                 if (View_GetSelection(pState, &start, &len)) {
-                    Doc_Delete(pState->pDoc, start, len);
-                    pState->wrapCacheValid = FALSE;
+                    View_DeleteRange(hwnd, pState, start, len);
                     pState->cursorOffset = pState->selectionAnchor = start;
                 }
 
-                // Insert the clipboard text
+                // Insert the clipboard text (re-wraps/re-measures only the lines it lands on)
                 size_t pasteLen = wcslen(pText);
-                Doc_Insert(pState->pDoc, pState->cursorOffset, pText, pasteLen);
-                pState->wrapCacheValid = FALSE;
-                // Pasted content can span multiple lines and introduce a long line anywhere
-                // in it, not just at the cursor - invalidate rather than incrementally grow;
-                // this is a one-time rescan on the next need, not a per-keystroke cost.
-                pState->docWidthValid = FALSE;
+                View_InsertText(hwnd, pState, pState->cursorOffset, pText, pasteLen);
                 pState->cursorOffset += pasteLen;
                 pState->selectionAnchor = pState->cursorOffset;
                 
@@ -1309,8 +1395,7 @@ static void DeleteSelection(HWND hwnd, ViewState* pState) {
     size_t start = 0, len = 0;
     if (!View_GetSelection(pState, &start, &len)) return;
 
-    Doc_Delete(pState->pDoc, start, len);
-    pState->wrapCacheValid = FALSE;
+    View_DeleteRange(hwnd, pState, start, len);
     pState->cursorOffset = pState->selectionAnchor = start;
 
     NotifyParent(hwnd, EN_CHANGE);
@@ -1328,9 +1413,12 @@ void ResetCaretBlink(ViewState* pState) {
 
 void View_SetWordWrap(HWND hwnd, BOOL bWrap) {
     ViewState* pState = GetState(hwnd);
-    if (pState && pState->bWordWrap != bWrap) {
+    if (!pState) return;
+    if (bWrap && !pState->bWrapAllowed) return; // Document too large - see View_SetDocument
+    if (!bWrap) pState->bWrapSuppressed = FALSE;
+    if (pState->bWordWrap != bWrap) {
         pState->bWordWrap = bWrap;
-        pState->wrapCacheValid = FALSE;  // Invalidate cache
+        View_InvalidateWrapCache(pState);
         // Edits made while word-wrapped don't update the doc-width cache (it's unused in
         // that mode), so it may be stale by the time we switch back to unwrapped mode.
         pState->docWidthValid = FALSE;
@@ -1339,6 +1427,16 @@ void View_SetWordWrap(HWND hwnd, BOOL bWrap) {
         UpdateScrollbars(hwnd, pState);
         InvalidateRect(hwnd, NULL, TRUE);
     }
+}
+
+BOOL View_GetWordWrap(HWND hwnd) {
+    ViewState* pState = GetState(hwnd);
+    return pState ? pState->bWordWrap : FALSE;
+}
+
+BOOL View_IsWordWrapAllowed(HWND hwnd) {
+    ViewState* pState = GetState(hwnd);
+    return pState ? pState->bWrapAllowed : TRUE;
 }
 
 BOOL View_ApplySearchResult(HWND hwnd, const DocSearchResult* result) {
@@ -1362,8 +1460,10 @@ BOOL View_ApplySearchResult(HWND hwnd, const DocSearchResult* result) {
     return TRUE;
 }
 
-static void PaintWrappedContent(ViewState* pState, HDC memDC, RECT rc, int tabStops, COLORREF currentText, COLORREF currentDim, size_t selStart, size_t selEnd, BOOL hasFocus) {
-    RebuildWrapCache(GetFocus(), pState);  // Note: You'll need to pass hwnd to this function
+static void PaintWrappedContent(HWND hwnd, ViewState* pState, HDC memDC, RECT rc, int tabStops, COLORREF currentText, COLORREF currentDim, size_t selStart, size_t selEnd, BOOL hasFocus) {
+    // Must be our own window: with GetFocus() the wrap width came out wrong whenever
+    // another window had focus, which forced a full re-wrap on every such paint.
+    RebuildWrapCache(hwnd, pState);
 
     if (!pState->wrapCacheValid || pState->visualLineCount == 0) {
         return;
@@ -1377,8 +1477,8 @@ static void PaintWrappedContent(ViewState* pState, HDC memDC, RECT rc, int tabSt
     COLORREF selText = hasFocus ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_BTNTEXT);
     HBRUSH hSelBrush = hasSelection ? CreateSolidBrush(selBg) : NULL;
 
-    // Draw each visual line
-    for (size_t i = 0; i < pState->visualLineCount; i++) {
+    // Draw each visual line, starting from the first one in view
+    for (size_t i = View_VisualLineAtY(pState, pState->scrollY); i < pState->visualLineCount; i++) {
         VisualLineInfo* vLine = &pState->visualLines[i];
         
         int yPos = vLine->yPosition - pState->scrollY;
@@ -1607,6 +1707,8 @@ static LRESULT HandleCreate(HWND hwnd) {
     pState->wrapCacheValid = FALSE;
     pState->cachedDocWidth = 0;
     pState->docWidthValid = FALSE;
+    pState->bWrapAllowed = TRUE;
+    pState->bWrapSuppressed = FALSE;
     pState->firstDirtyLine = SIZE_MAX;
     pState->dirtyLineDelta = 0;
     pState->docGeneration = 0;  
@@ -2048,8 +2150,7 @@ static LRESULT HandleChar(HWND hwnd, ViewState* pState, WPARAM wParam) {
             pState->commandLen++;
             pState->commandCaretPos++;
             pState->szCommandBuf[pState->commandLen] = L'\0';
-            pState->wrapCacheValid = FALSE;
-            
+
             InvalidateRect(hwnd, NULL, TRUE);
             UpdateCaretPosition(hwnd, pState);
         }
@@ -2065,26 +2166,10 @@ static LRESULT HandleChar(HWND hwnd, ViewState* pState, WPARAM wParam) {
     if (c == L'\r' || c == L'\n' || (c >= 32) || c == L'\t') {
         if (c == L'\r') c = L'\n'; // Normalize to LF
 
-        // Capture initial state for incremental update
-        size_t oldLineCount = pState->pDoc->line_count;
-        size_t changeStartLine = 0;
-        {
-            // Determine where the change starts (min of cursor or selection start)
-            size_t startOff = pState->cursorOffset;
-            size_t sStart, sLen;
-            if (View_GetSelection(pState, &sStart, &sLen)) {
-                if (sStart < startOff) startOff = sStart;
-            }
-            int l, col;
-            Doc_GetOffsetInfo(pState->pDoc, startOff, &l, &col);
-            changeStartLine = (l > 0) ? l - 1 : 0;
-        }
-
         // Replace any highlighted selection with the typed character
         size_t selStart = 0, selLen = 0;
         if (View_GetSelection(pState, &selStart, &selLen)) {
-            Doc_Delete(pState->pDoc, selStart, selLen);
-            // pState->wrapCacheValid = FALSE; // Handled by Notify below
+            View_DeleteRange(hwnd, pState, selStart, selLen);
             pState->cursorOffset = pState->selectionAnchor = selStart;
         } else if (!pState->bInsertMode && c != L'\n') {
             // Overtype logic: Remove the next character if we aren't at EOF
@@ -2093,24 +2178,13 @@ static LRESULT HandleChar(HWND hwnd, ViewState* pState, WPARAM wParam) {
                 Doc_GetText(pState->pDoc, pState->cursorOffset, 1, &nextChar);
                 // Don't overtype the newline; it preserves the document's line structure
                 if (nextChar != L'\n') {
-                    Doc_Delete(pState->pDoc, pState->cursorOffset, 1);
-                    // pState->wrapCacheValid = FALSE;
+                    View_DeleteRange(hwnd, pState, pState->cursorOffset, 1);
                 }
             }
         }
 
-        // Insert the character and collapse the selection/anchor
-        Doc_Insert(pState->pDoc, pState->cursorOffset, &c, 1);
-
-        // Notify incremental update
-        long delta = (long)pState->pDoc->line_count - (long)oldLineCount;
-        View_NotifyContentChange(pState, changeStartLine, delta);
-
-        // A single non-newline character can only make its own line wider, never any
-        // other line - cheap to keep the doc-width cache in sync without a full rescan.
-        if (c != L'\n') {
-            View_GrowDocWidthForLine(hwnd, pState, changeStartLine);
-        }
+        // Insert the character (updates the wrap/width caches incrementally)
+        View_InsertText(hwnd, pState, pState->cursorOffset, &c, 1);
 
         pState->cursorOffset++;
         pState->selectionAnchor = pState->cursorOffset;
@@ -2337,19 +2411,16 @@ static LRESULT HandleKeyDown(HWND hwnd, ViewState* pState, WPARAM wParam, LPARAM
         case VK_DELETE:
             size_t delStart = 0, delLen = 0;
             if (View_GetSelection(pState, &delStart, &delLen)) {
-                Doc_Delete(pState->pDoc, delStart, delLen);
-                pState->wrapCacheValid = FALSE;
+                View_DeleteRange(hwnd, pState, delStart, delLen);
                 pState->cursorOffset = pState->selectionAnchor = delStart;
                 NotifyParent(hwnd, EN_CHANGE);
             } else {
                 if (wParam == VK_BACK && pState->cursorOffset > 0) {
-                    Doc_Delete(pState->pDoc, --pState->cursorOffset, 1);
-                    pState->wrapCacheValid = FALSE;
+                    View_DeleteRange(hwnd, pState, --pState->cursorOffset, 1);
                     pState->selectionAnchor = pState->cursorOffset;
                     NotifyParent(hwnd, EN_CHANGE);
                 } else if (wParam == VK_DELETE && pState->cursorOffset < pState->pDoc->total_length) {
-                    Doc_Delete(pState->pDoc, pState->cursorOffset, 1);
-                    pState->wrapCacheValid = FALSE;
+                    View_DeleteRange(hwnd, pState, pState->cursorOffset, 1);
                     NotifyParent(hwnd, EN_CHANGE);
                 }
             }
@@ -2407,7 +2478,7 @@ static LRESULT HandlePaint(HWND hwnd, ViewState* pState) {
 
     if (pState->pDoc && pState->pDoc->line_count > 0) {
         if (pState->bWordWrap) {
-            PaintWrappedContent(pState, memDC, rc, tabStops, currentText, currentDim, selStart, selEnd, hasFocus);
+            PaintWrappedContent(hwnd, pState, memDC, rc, tabStops, currentText, currentDim, selStart, selEnd, hasFocus);
         } else {
             PaintUnwrappedContent(pState, memDC, rc, tabStops, currentBg, currentText, currentDim, selStart, selEnd, hasFocus);
         }

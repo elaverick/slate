@@ -210,6 +210,24 @@ void UpdateStatusBar(SLATE_APP* app) {
 }
 
 /**
+ * Reflects the view's word-wrap state in the menu and status bar. Call after every
+ * View_SetDocument: a document too large to wrap greys out the menu item, and the next
+ * normal-sized document (new or loaded) re-enables it and restores wrap if it was on.
+ */
+void SyncWordWrapUI(SLATE_APP* app) {
+    BOOL allowed = View_IsWordWrapAllowed(app->hEdit);
+    HMENU hMenu = GetMenu(app->hwnd);
+    if (hMenu) {
+        EnableMenuItem(hMenu, ID_VIEW_WORDWRAP, MF_BYCOMMAND | (allowed ? MF_ENABLED : MF_GRAYED));
+        CheckMenuItem(hMenu, ID_VIEW_WORDWRAP, MF_BYCOMMAND | (View_GetWordWrap(app->hEdit) ? MF_CHECKED : MF_UNCHECKED));
+    }
+    if (app->hStatus) {
+        SendMessage(app->hStatus, SB_SETTEXT, STATUS_PART_INFO,
+                    (LPARAM)(allowed ? _T("") : _T("Word wrap unavailable for large files")));
+    }
+}
+
+/**
  * Memory-Mapped File Loader
  */
 BOOL LoadFile(SLATE_APP* app, const TCHAR* pszFileName) {
@@ -283,6 +301,7 @@ BOOL LoadFile(SLATE_APP* app, const TCHAR* pszFileName) {
     app->pDoc = pNewDoc;
 
     View_SetDocument(app->hEdit, app->pDoc);
+    SyncWordWrapUI(app);
     _tcscpy_s(app->szFileName, _countof(app->szFileName), pszFileName);
     app->bIsModified = FALSE;
     
@@ -360,8 +379,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
             // Create the Status Bar
             g_app.hStatus = CreateStatusWindow(WS_CHILD | WS_VISIBLE | SBARS_SIZEGRIP, 
                                              _T("Ready"), hwnd, IDC_STATUSBAR);
-            int parts[] = { 150, 250, 350, 380 };
-            SendMessage(g_app.hStatus, SB_SETPARTS, 4, (LPARAM)parts);
+            int parts[] = { 150, 250, 350, 380, -1 };
+            SendMessage(g_app.hStatus, SB_SETPARTS, 5, (LPARAM)parts);
 
             // Create the Virtual Viewport
             HINSTANCE hInst = ((LPCREATESTRUCT)lParam)->hInstance;
@@ -440,7 +459,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam) 
                         
                         // This is the handshake
                         View_SetDocument(g_app.hEdit, g_app.pDoc);
-                        
+                        SyncWordWrapUI(&g_app);
+
                         // CRITICAL: Force the window to reclaim the caret
                         SetFocus(g_app.hEdit); 
                         

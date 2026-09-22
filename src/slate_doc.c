@@ -4,6 +4,7 @@
 
 #define LINE_MAP_GROW_STEP 1024
 #define LINE_SCAN_STEP_BYTES (64 * 1024)
+#define UTF8_CKPT_STRIDE (16 * 1024)
 
 static Piece* CreatePiece(BufferType buffer, size_t start, size_t length, size_t rawLength, BOOL isUtf8) {
     Piece* p = (Piece*)malloc(sizeof(Piece));
@@ -59,6 +60,58 @@ static int Utf8SeqInfo(const unsigned char* buf, size_t i, size_t limit, int* ou
     return seqLen;
 }
 
+// Returns the index of the checkpoint chunk containing byte b, i.e. the largest k
+// with utf8_ckpt_byte[k] <= b (never the sentinel).
+static size_t Utf8CkptIndexForByte(const SlateDoc* doc, size_t b) {
+    size_t k = b / UTF8_CKPT_STRIDE;
+    if (k > doc->utf8_ckpt_count - 2) k = doc->utf8_ckpt_count - 2;
+    while (k > 0 && doc->utf8_ckpt_byte[k] > b) k--;
+    return k;
+}
+
+// Walks forward from a known (byte, absolute unit) position, stopping at stopByte or
+// before any character that would take the unit count past maxUnits (so a surrogate
+// pair is never split). Whole pure-ASCII checkpoint chunks are skipped arithmetically.
+// Returns the byte reached; *outUnits receives the absolute unit count there.
+static size_t Utf8Walk(const SlateDoc* doc, size_t i, size_t units, size_t stopByte, size_t maxUnits, size_t* outUnits) {
+    const unsigned char* buf = (const unsigned char*)doc->original_buffer;
+    BOOL blocked = FALSE;
+
+    while (!blocked && i < stopByte && units < maxUnits) {
+        size_t k = Utf8CkptIndexForByte(doc, i);
+        size_t chunkEnd = doc->utf8_ckpt_byte[k + 1];
+        BOOL ascii = (doc->utf8_ckpt_byte[k + 1] - doc->utf8_ckpt_byte[k]) ==
+                     (doc->utf8_ckpt_units[k + 1] - doc->utf8_ckpt_units[k]);
+        if (chunkEnd > stopByte) chunkEnd = stopByte;
+
+        if (ascii) {
+            size_t n = chunkEnd - i;
+            if (n > maxUnits - units) n = maxUnits - units;
+            i += n;
+            units += n;
+        } else {
+            while (i < chunkEnd && units < maxUnits) {
+                int u;
+                int seqLen = Utf8SeqInfo(buf, i, stopByte, &u);
+                if (units + (size_t)u > maxUnits) { blocked = TRUE; break; }
+                units += (size_t)u;
+                i += (size_t)seqLen;
+            }
+        }
+    }
+
+    *outUnits = units;
+    return i;
+}
+
+// Absolute UTF-16 unit position of byte b (which must be a character boundary).
+static size_t Utf8UnitsAtByte(const SlateDoc* doc, size_t b) {
+    size_t k = Utf8CkptIndexForByte(doc, b);
+    size_t units;
+    Utf8Walk(doc, doc->utf8_ckpt_byte[k], doc->utf8_ckpt_units[k], b, SIZE_MAX, &units);
+    return units;
+}
+
 // Walks forward from byteStart (up to byteLimit), consuming up to maxUnits
 // logical UTF-16 units, and returns the byte offset reached. Never splits a
 // surrogate pair: if consuming the next character would overshoot maxUnits,
@@ -66,18 +119,52 @@ static int Utf8SeqInfo(const unsigned char* buf, size_t i, size_t limit, int* ou
 // of units actually consumed, which can be less than maxUnits if the piece
 // runs out of bytes, or if the target falls between the two halves of a
 // surrogate pair.
-static size_t Utf8ByteOffsetForUnits(const unsigned char* buf, size_t byteStart, size_t byteLimit, size_t maxUnits, size_t* outUnits) {
-    size_t i = byteStart;
-    size_t units = 0;
-    while (i < byteLimit && units < maxUnits) {
-        int u;
-        int seqLen = Utf8SeqInfo(buf, i, byteLimit, &u);
-        if (units + (size_t)u > maxUnits) break;
-        units += (size_t)u;
-        i += (size_t)seqLen;
+//
+// Uses the document's checkpoint index, so the cost is bounded by a couple of
+// checkpoint strides regardless of how far into the file byteStart is.
+static size_t Utf8ByteOffsetForUnits(const SlateDoc* doc, size_t byteStart, size_t byteLimit, size_t maxUnits, size_t* outUnits) {
+    const unsigned char* buf = (const unsigned char*)doc->original_buffer;
+
+    if (!doc->utf8_ckpt_byte) {
+        // No index (allocation failed at load) - plain linear walk
+        size_t i = byteStart;
+        size_t units = 0;
+        while (i < byteLimit && units < maxUnits) {
+            int u;
+            int seqLen = Utf8SeqInfo(buf, i, byteLimit, &u);
+            if (units + (size_t)u > maxUnits) break;
+            units += (size_t)u;
+            i += (size_t)seqLen;
+        }
+        if (outUnits) *outUnits = units;
+        return i;
     }
-    if (outUnits) *outUnits = units;
-    return i;
+
+    size_t u0 = Utf8UnitsAtByte(doc, byteStart);
+    size_t target = (maxUnits > SIZE_MAX - u0) ? SIZE_MAX : u0 + maxUnits;
+
+    // Jump to the furthest checkpoint that is still at or before both the target
+    // unit position and byteLimit, then walk the remainder.
+    size_t lo = 0, hi = doc->utf8_ckpt_count; // find last k with units[k] <= target
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (doc->utf8_ckpt_units[mid] <= target) lo = mid + 1;
+        else hi = mid;
+    }
+    size_t k = (lo > 0) ? lo - 1 : 0;
+    size_t kLimit = Utf8CkptIndexForByte(doc, byteLimit);
+    if (k > kLimit) k = kLimit;
+
+    size_t i = byteStart, units = u0;
+    if (doc->utf8_ckpt_byte[k] > byteStart) {
+        i = doc->utf8_ckpt_byte[k];
+        units = doc->utf8_ckpt_units[k];
+    }
+
+    size_t endUnits;
+    size_t endByte = Utf8Walk(doc, i, units, byteLimit, target, &endUnits);
+    if (outUnits) *outUnits = endUnits - u0;
+    return endByte;
 }
 
 // Counts the total number of UTF-16 units a (possibly huge) UTF-8 byte buffer decodes
@@ -113,6 +200,42 @@ static size_t Utf8CountUnitsChunked(const unsigned char* buf, size_t byteLen) {
     return total;
 }
 
+// Builds the UTF-8 checkpoint index over the original buffer (see SlateDoc) and
+// returns the buffer's total length in UTF-16 units. One pass over the file,
+// in stride-sized MultiByteToWideChar calls (far below its 1 GiB per-call limit).
+// If the index can't be allocated, conversions fall back to linear walks.
+static size_t Utf8BuildCheckpoints(SlateDoc* doc, const unsigned char* buf, size_t len) {
+    size_t count = len / UTF8_CKPT_STRIDE + 2; // entries 0..len/STRIDE, plus the sentinel
+    size_t* bytes = (size_t*)malloc(count * sizeof(size_t));
+    size_t* units = (size_t*)malloc(count * sizeof(size_t));
+    if (!bytes || !units) {
+        free(bytes);
+        free(units);
+        return Utf8CountUnitsChunked(buf, len);
+    }
+
+    bytes[0] = 0;
+    units[0] = 0;
+    for (size_t k = 1; k < count; k++) {
+        size_t b = len;
+        if (k < count - 1) {
+            // Move forward off any continuation bytes onto the next character boundary
+            b = k * UTF8_CKPT_STRIDE;
+            size_t limit = b + 3;
+            while (b < len && b < limit && (buf[b] & 0xC0) == 0x80) b++;
+        }
+        size_t prev = bytes[k - 1];
+        int n = (b > prev) ? MultiByteToWideChar(CP_UTF8, 0, (const char*)buf + prev, (int)(b - prev), NULL, 0) : 0;
+        bytes[k] = b;
+        units[k] = units[k - 1] + (size_t)(n > 0 ? n : 0);
+    }
+
+    doc->utf8_ckpt_byte = bytes;
+    doc->utf8_ckpt_units = units;
+    doc->utf8_ckpt_count = count;
+    return units[count - 1];
+}
+
 static Piece* SplitPiece(SlateDoc* doc, size_t offset) {
     if (offset == 0) return doc->head;
     if (offset >= doc->total_length) return NULL;
@@ -130,9 +253,8 @@ static Piece* SplitPiece(SlateDoc* doc, size_t offset) {
 
             if (curr->buffer == BUFFER_ORIGINAL && curr->isUtf8) {
                 // Translate the logical split point into a byte offset within the raw UTF-8 storage
-                const unsigned char* buf = (const unsigned char*)doc->original_buffer;
                 size_t unitsConsumed = 0;
-                size_t byteOff = Utf8ByteOffsetForUnits(buf, curr->start, curr->start + curr->rawLength, splitPoint, &unitsConsumed);
+                size_t byteOff = Utf8ByteOffsetForUnits(doc, curr->start, curr->start + curr->rawLength, splitPoint, &unitsConsumed);
 
                 firstRawLength = byteOff - curr->start;
                 secondStart = byteOff;
@@ -166,8 +288,11 @@ static BOOL Doc_GrowLineOffsets(SlateDoc* doc, size_t minExtra) {
     size_t needed = doc->line_count + minExtra;
     if (needed < doc->line_capacity) return TRUE;
 
-    size_t newCap = doc->line_capacity;
-    while (newCap <= needed) newCap += LINE_MAP_GROW_STEP;
+    // Grow geometrically: fixed-step growth made building the map for a file with
+    // millions of lines quadratic in realloc copying.
+    size_t newCap = doc->line_capacity * 2;
+    if (newCap < LINE_MAP_GROW_STEP) newCap = LINE_MAP_GROW_STEP;
+    while (newCap <= needed) newCap *= 2;
 
     size_t* newOffsets = realloc(doc->line_offsets, newCap * sizeof(size_t));
     if (!newOffsets) return FALSE;
@@ -272,8 +397,7 @@ static void Doc_LocateScanResumePoint(SlateDoc* pDoc, size_t target, Piece** out
 
     size_t logicalIntoPiece = target - cumulative;
     if (piece->buffer == BUFFER_ORIGINAL && piece->isUtf8) {
-        const unsigned char* buf = (const unsigned char*)pDoc->original_buffer;
-        size_t byteOff = Utf8ByteOffsetForUnits(buf, piece->start, piece->start + piece->rawLength, logicalIntoPiece, NULL);
+        size_t byteOff = Utf8ByteOffsetForUnits(pDoc, piece->start, piece->start + piece->rawLength, logicalIntoPiece, NULL);
         *outPieceOffset = byteOff - piece->start;
     } else {
         *outPieceOffset = logicalIntoPiece;
@@ -316,45 +440,95 @@ void Doc_RefreshMetadata(SlateDoc* pDoc) {
     }
 }
 
-// Incremental metadata refresh for a single edit (insert or delete) that
-// starts at `editOffset`. Recomputes total_length, but instead of throwing
-// away the whole line map, it only discards line-start entries at or after
-// the edit point (anything before is untouched by the edit) and resumes lazy
-// scanning from there. This keeps Doc_Insert/Doc_Delete - called on every
-// keystroke - from forcing an O(document size) rescan on every edit.
-static void Doc_RefreshMetadataFrom(SlateDoc* pDoc, size_t editOffset) {
-    if (!pDoc) return;
-
-    Doc_RecalculateTotalLength(pDoc);
-
-    if (!pDoc->line_offsets) {
-        Doc_RefreshMetadata(pDoc); // No map allocated yet - fall back to a full (cheap) reset
-        return;
-    }
-
-    // Binary search for the first cached line-start offset after editOffset;
-    // everything before that index remains valid and unchanged.
-    size_t lo = 0, hi = pDoc->line_count;
+// Index of the first line-start entry strictly greater than `offset`.
+static size_t Doc_LineUpperBound(const SlateDoc* doc, size_t offset) {
+    size_t lo = 0, hi = doc->line_count;
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
-        if (pDoc->line_offsets[mid] <= editOffset) lo = mid + 1;
+        if (doc->line_offsets[mid] <= offset) lo = mid + 1;
         else hi = mid;
     }
-    pDoc->line_count = lo;
+    return lo;
+}
 
-    size_t resumeOffset = (lo > 0) ? pDoc->line_offsets[lo - 1] : 0;
-    if (resumeOffset > pDoc->total_length) resumeOffset = pDoc->total_length;
+// After an edit, the lazy scanner's saved piece pointer may have been split or
+// freed. Re-derive it from the (logical) scan offset, and restore the EOF
+// sentinel entry if the map is complete.
+static void Doc_SyncLineScanState(SlateDoc* doc) {
+    if (doc->line_scan_offset > doc->total_length) doc->line_scan_offset = doc->total_length;
 
-    Piece* piece;
-    size_t pieceOffset;
-    Doc_LocateScanResumePoint(pDoc, resumeOffset, &piece, &pieceOffset);
+    if (doc->line_map_complete) {
+        doc->line_offsets[doc->line_count] = doc->total_length;
+        doc->line_scan_piece = NULL;
+        doc->line_scan_piece_offset = 0;
+        return;
+    }
+    Doc_LocateScanResumePoint(doc, doc->line_scan_offset, &doc->line_scan_piece, &doc->line_scan_piece_offset);
+}
 
-    pDoc->line_scan_offset = resumeOffset;
-    pDoc->line_scan_piece = piece;
-    pDoc->line_scan_piece_offset = pieceOffset;
-    // Left FALSE unconditionally: Doc_EnsureLineMapUpTo already sets this back
-    // to TRUE itself as soon as it discovers there's nothing left to scan.
-    pDoc->line_map_complete = FALSE;
+// Keeps the line map in step with an insert of text[0..len) at `offset`
+// (pieces and total_length already updated; oldTotal is the length before).
+// Instead of discarding and rescanning, entries after the edit are shifted and
+// the inserted newlines get new entries, so line_count stays accurate and no
+// document data is rescanned. Only the already-scanned prefix is touched.
+static void Doc_LineMapOnInsert(SlateDoc* doc, size_t offset, const WCHAR* text, size_t len, size_t oldTotal) {
+    if (!doc->line_offsets) { Doc_RefreshMetadata(doc); return; }
+
+    size_t scanned = doc->line_map_complete ? oldTotal : doc->line_scan_offset;
+    if (offset <= scanned) {
+        size_t newlines = 0;
+        for (size_t i = 0; i < len; i++) if (text[i] == L'\n') newlines++;
+
+        if (!Doc_GrowLineOffsets(doc, newlines + 1)) { Doc_RefreshMetadata(doc); return; }
+
+        size_t idx = Doc_LineUpperBound(doc, offset);
+        size_t tail = doc->line_count - idx;
+        if (newlines > 0 && tail > 0) {
+            memmove(doc->line_offsets + idx + newlines, doc->line_offsets + idx, tail * sizeof(size_t));
+        }
+        for (size_t i = idx + newlines; i < doc->line_count + newlines; i++) {
+            doc->line_offsets[i] += len;
+        }
+        size_t w = idx;
+        for (size_t i = 0; i < len; i++) {
+            if (text[i] == L'\n') doc->line_offsets[w++] = offset + i + 1;
+        }
+        doc->line_count += newlines;
+        doc->line_scan_offset = scanned + len;
+    }
+    Doc_SyncLineScanState(doc);
+}
+
+// Counterpart of Doc_LineMapOnInsert for deleting [offset, offset + len):
+// entries for deleted newlines are removed and later entries shift back.
+static void Doc_LineMapOnDelete(SlateDoc* doc, size_t offset, size_t len, size_t oldTotal) {
+    if (!doc->line_offsets) { Doc_RefreshMetadata(doc); return; }
+
+    size_t scanned = doc->line_map_complete ? oldTotal : doc->line_scan_offset;
+    if (offset < scanned) {
+        size_t end = offset + len;
+        size_t removeTo = (end < scanned) ? end : scanned;
+        size_t lo = Doc_LineUpperBound(doc, offset);
+        size_t hi = Doc_LineUpperBound(doc, removeTo);
+
+        if (hi > lo) {
+            memmove(doc->line_offsets + lo, doc->line_offsets + hi, (doc->line_count - hi) * sizeof(size_t));
+            doc->line_count -= (hi - lo);
+        }
+        for (size_t i = lo; i < doc->line_count; i++) {
+            doc->line_offsets[i] -= len;
+        }
+
+        if (scanned > end) {
+            doc->line_scan_offset = scanned - len;
+        } else {
+            // The deletion ran past the scan frontier; resume scanning from the edit
+            // (unless it deleted through to EOF, in which case the map is complete)
+            doc->line_scan_offset = offset;
+            doc->line_map_complete = (offset >= doc->total_length);
+        }
+    }
+    Doc_SyncLineScanState(doc);
 }
 
 Piece* ClonePieceList(Piece* head) {
@@ -532,7 +706,7 @@ SlateDoc* Doc_CreateFromMap(void* pMappedText, size_t len, HANDLE hMap, void* pB
     // Chunked to stay correct for files at or beyond INT_MAX bytes.
     size_t logicalLen = len;
     if (isUtf8 && len > 0) {
-        logicalLen = Utf8CountUnitsChunked((const unsigned char*)pMappedText, len);
+        logicalLen = Utf8BuildCheckpoints(doc, (const unsigned char*)pMappedText, len);
     }
 
     doc->head = CreatePiece(BUFFER_ORIGINAL, 0, logicalLen, len, isUtf8);
@@ -561,6 +735,8 @@ void Doc_Destroy(SlateDoc* doc) {
     }
     free(doc->add_buffer);
     free(doc->line_offsets);
+    free(doc->utf8_ckpt_byte);
+    free(doc->utf8_ckpt_units);
     free(doc);
 }
 
@@ -626,8 +802,10 @@ BOOL Doc_Insert(SlateDoc* doc, size_t offset, const WCHAR* text, size_t len) {
         }
     }
 
-    // Update metadata and line map (incrementally - only from the edit point onward)
-    Doc_RefreshMetadataFrom(doc, offset);
+    // Update length and shift the line map in place (no rescan)
+    size_t oldTotal = doc->total_length;
+    Doc_RecalculateTotalLength(doc);
+    Doc_LineMapOnInsert(doc, offset, text, len, oldTotal);
 
     return TRUE;
 }
@@ -672,8 +850,10 @@ BOOL Doc_Delete(SlateDoc* doc, size_t offset, size_t len) {
         }
     }
 
-    // Refresh metadata and line map (incrementally - only from the edit point onward)
-    Doc_RefreshMetadataFrom(doc, offset);
+    // Update length and shift the line map in place (no rescan)
+    size_t oldTotal = doc->total_length;
+    Doc_RecalculateTotalLength(doc);
+    Doc_LineMapOnDelete(doc, offset, len, oldTotal);
 
     return TRUE;
 }
@@ -700,8 +880,8 @@ size_t Doc_GetText(SlateDoc* doc, size_t offset, size_t len, WCHAR* dest) {
                 // startInPiece/takeFromPiece are logical (UTF-16) units; translate them
                 // into a byte range within the raw UTF-8 storage before decoding.
                 const unsigned char* buf = (const unsigned char*)doc->original_buffer;
-                size_t byteStart = Utf8ByteOffsetForUnits(buf, curr->start, curr->start + curr->rawLength, startInPiece, NULL);
-                size_t byteEnd = Utf8ByteOffsetForUnits(buf, byteStart, curr->start + curr->rawLength, takeFromPiece, NULL);
+                size_t byteStart = Utf8ByteOffsetForUnits(doc, curr->start, curr->start + curr->rawLength, startInPiece, NULL);
+                size_t byteEnd = Utf8ByteOffsetForUnits(doc, byteStart, curr->start + curr->rawLength, takeFromPiece, NULL);
 
                 int written = 0;
                 if (byteEnd > byteStart) {
@@ -763,18 +943,12 @@ void Doc_GetOffsetInfo(SlateDoc* doc, size_t offset, int* out_line, int* out_col
 
     Doc_EnsureLineMapUpTo(doc, offset);
 
-    // Binary search or linear scan through the line map
-    int line = 1;
-    for (size_t i = 0; i < doc->line_count; i++) {
-        if (doc->line_offsets[i] <= offset) {
-            line = (int)i + 1;
-        } else {
-            break;
-        }
-    }
-    
-    *out_line = line;
-    *out_col = (int)(offset - doc->line_offsets[line - 1]) + 1;
+    // Binary search for the last line starting at or before offset
+    size_t idx = Doc_LineUpperBound(doc, offset);
+    if (idx == 0) idx = 1;
+
+    *out_line = (int)idx;
+    *out_col = (int)(offset - doc->line_offsets[idx - 1]) + 1;
 }
 
 // ------------------------------
@@ -811,8 +985,7 @@ static BOOL DocIter_Seek(SlateDoc* doc, size_t targetOffset, DocCharIterator* it
     if (curr) {
         size_t logicalIntoPiece = targetOffset - cumulative;
         if (curr->buffer == BUFFER_ORIGINAL && curr->isUtf8) {
-            const unsigned char* buf = (const unsigned char*)doc->original_buffer;
-            size_t byteOff = Utf8ByteOffsetForUnits(buf, curr->start, curr->start + curr->rawLength, logicalIntoPiece, NULL);
+            size_t byteOff = Utf8ByteOffsetForUnits(doc, curr->start, curr->start + curr->rawLength, logicalIntoPiece, NULL);
             it->pieceOffset = byteOff - curr->start;
         } else {
             it->pieceOffset = logicalIntoPiece;

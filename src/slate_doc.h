@@ -27,7 +27,16 @@ typedef struct {
     HANDLE hMapFile;
     size_t original_len;
     BOOL   original_is_utf8;     // Flag for the mapped file encoding
-    
+
+    // Sparse UTF-8 -> UTF-16 position index over original_buffer (UTF-8 files only).
+    // Entry k is a character boundary at or just after k * UTF8_CKPT_STRIDE bytes, with
+    // the number of UTF-16 units that precede it; the final entry is a sentinel at
+    // original_len. Lets byte<->unit conversions scan at most one stride instead of
+    // walking from the start of the file.
+    size_t* utf8_ckpt_byte;
+    size_t* utf8_ckpt_units;
+    size_t  utf8_ckpt_count;
+
     WCHAR* add_buffer;
     size_t add_len;
     size_t add_capacity;

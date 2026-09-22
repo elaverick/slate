@@ -27,6 +27,10 @@ typedef struct VisualLineInfo {
     int yPosition;           // Y position in document space
 } VisualLineInfo;
 
+// Documents longer than this (in UTF-16 units, ~8 MB of ASCII) open unwrapped: the wrap
+// layout is built for the whole document, which takes a few seconds at this size.
+#define VIEW_MAX_WRAP_UNITS ((size_t)8 * 1024 * 1024)
+
 typedef struct {
     SlateDoc* pDoc;
     size_t docGeneration;  // Track when document changes
@@ -39,7 +43,9 @@ typedef struct {
     size_t selectionAnchor; // This is where the selection started
     BOOL isDragging;
     BOOL bInsertMode;
-    BOOL bWordWrap;
+    BOOL bWordWrap;         // Effective wrap state
+    BOOL bWrapAllowed;      // FALSE when the document is too large to lay out wrapped
+    BOOL bWrapSuppressed;   // Wrap was requested but is held off for a too-large document
     BOOL bShowNonPrintable;
     COLORREF colorBg;
     COLORREF colorBgDim;
@@ -67,8 +73,13 @@ typedef struct {
     int cachedWrapWidth;
     BOOL wrapCacheValid;
     
-    // Incremental wrap cache state
-    size_t firstDirtyLine;     // Logical line index where change started (SIZE_MAX if none/full rebuild)
+    // Incremental wrap cache state. Pending edits since the last rebuild replaced the
+    // cached logical lines [firstDirtyLine, dirtyOldEndLine) (in the cache's own line
+    // numbering) with (dirtyOldEndLine - firstDirtyLine + dirtyLineDelta) new lines.
+    // firstDirtyLine == SIZE_MAX means no incremental information is pending: either
+    // the cache is clean, or (with wrapCacheValid FALSE) a full rebuild is needed.
+    size_t firstDirtyLine;
+    size_t dirtyOldEndLine;
     long dirtyLineDelta;       // Change in document line count (+N or -N)
 
     // Cached max line width (unwrapped mode's horizontal scrollbar range). Only ever safe
@@ -92,6 +103,8 @@ void View_Copy(HWND hwnd);
 void View_Cut(HWND hwnd);
 void View_Paste(HWND hwnd);
 void View_SetWordWrap(HWND hwnd, BOOL bWrap);
+BOOL View_GetWordWrap(HWND hwnd);
+BOOL View_IsWordWrapAllowed(HWND hwnd);
 void View_SetShowNonPrintable(HWND hwnd, BOOL bShow);
 void View_SetDefaultColors(HWND hwnd);
 void View_UseSystemColors(HWND hwnd);

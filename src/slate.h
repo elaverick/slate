@@ -34,6 +34,7 @@
 #define STATUS_PART_INSERT   1
 #define STATUS_PART_CAPS     2
 #define STATUS_PART_VIEWMODE 3
+#define STATUS_PART_INFO     4
 
 // Application state structure
 typedef struct {
@@ -54,6 +55,7 @@ HMENU CreateMenuBar(void);
 void CreateControls(SLATE_APP* app);
 void UpdateStatusBar(SLATE_APP* app);
 void UpdateTitleBar(SLATE_APP* app);
+void SyncWordWrapUI(SLATE_APP* app);
 BOOL LoadFile(SLATE_APP* app, const TCHAR* pszFileName);
 BOOL SaveFile(SLATE_APP* app, const TCHAR* pszFileName);
 void ShowAboutDialog(HWND hwndParent);
