@@ -42,58 +42,161 @@ static BOOL View_LoadLine(ViewState* pState, size_t lineIdx, size_t* pLineStart,
     return TRUE;
 }
 
-// Rebuild the visual line cache for wrapped display
+// Mark a range of logical lines as needing re-wrap
+static void View_NotifyContentChange(ViewState* pState, size_t startLine, long lineCountDelta) {
+    if (!pState) return;
+
+    // If we're already set for a full rebuild (SIZE_MAX), don't bother tracking details
+    if (pState->firstDirtyLine == SIZE_MAX) return;
+
+    // Update the dirty start line (min of current and new)
+    if (startLine < pState->firstDirtyLine) {
+        pState->firstDirtyLine = startLine;
+    }
+
+    // Accumulate the line count delta
+    pState->dirtyLineDelta += lineCountDelta;
+
+    // Invalidate the validity flag so next paint triggers rebuild
+    pState->wrapCacheValid = FALSE;
+}
+
+// Rebuild the visual line cache for wrapped display (Supports Incremental)
 static void RebuildWrapCache(HWND hwnd, ViewState* pState) {
     if (!pState || !pState->pDoc || !pState->bWordWrap) {
         pState->wrapCacheValid = FALSE;
         pState->visualLineCount = 0;
+        pState->firstDirtyLine = SIZE_MAX;
         return;
     }
 
     if (pState->pDoc->line_count == 0) {
         pState->wrapCacheValid = FALSE;
         pState->visualLineCount = 0;
+        pState->firstDirtyLine = SIZE_MAX;
         return;
     }
 
     RECT clientRect;
     GetClientRect(hwnd, &clientRect);
     int wrapWidth = clientRect.right - 10;
+    if (wrapWidth < 10) wrapWidth = 10;
 
-    // Check if we need to rebuild - MUST check document generation!
+    // 1. Validation Check: If everything matches, we are good.
     if (pState->wrapCacheValid && 
         pState->cachedWrapWidth == wrapWidth &&
         pState->cachedDocGeneration == pState->docGeneration) {
         
-        // Lazy line map check: if the document has discovered more lines since we cached,
-        // our "last line" (which previously contained the rest of the file) is now invalid.
+        // Lazy check for appended lines (common when loading/tailing)
         if (pState->visualLineCount > 0) {
             size_t lastCachedLogLine = pState->visualLines[pState->visualLineCount - 1].logicalLine;
             if (lastCachedLogLine == pState->pDoc->line_count - 1) {
-                return;  // Cache is still valid
+                return; // Cache is fully valid
             }
         }
     }
 
-    // Cache is invalid, rebuild it
     HDC hdc = GetDC(hwnd);
     SelectObject(hdc, pState->hFont);
-
     TEXTMETRIC tm;
     GetTextMetrics(hdc, &tm);
     int tabStops = tm.tmAveCharWidth * 4;
 
-    // Allocate initial capacity
-    if (!pState->visualLines) {
-        pState->visualLineCapacity = 1024;
-        pState->visualLines = (VisualLineInfo*)malloc(pState->visualLineCapacity * sizeof(VisualLineInfo));
-    }
-    pState->visualLineCount = 0;
+    // 2. Decide Strategy: Incremental vs Full
+    BOOL isIncremental = (pState->cachedWrapWidth == wrapWidth) && 
+                         (pState->firstDirtyLine != SIZE_MAX) &&
+                         (pState->visualLines != NULL) &&
+                         (pState->visualLineCount > 0);
 
+    // If the cache was totally invalid (e.g. resize), force full rebuild
+    if (pState->cachedWrapWidth != wrapWidth) isIncremental = FALSE;
+
+    // Setup range to process
+    size_t startLogLine = 0;
+    size_t endLogLine = pState->pDoc->line_count;
+    size_t insertPos = 0; // Index in visualLines where we start writing
     int currentY = 0;
 
-    // Process each logical line
-    for (size_t logLine = 0; logLine < pState->pDoc->line_count; logLine++) {
+    // Temp buffer for new visual lines
+    VisualLineInfo* newLines = NULL;
+    size_t newLinesCount = 0;
+    size_t newLinesCap = 0;
+    
+    // For incremental update, we need to know what to remove and shift
+    size_t removeStartIdx = 0;
+    size_t removeEndIdx = 0; // Exclusive
+    long shiftDelta = 0;
+    int yShift = 0;
+
+    if (isIncremental) {
+        startLogLine = pState->firstDirtyLine;
+        shiftDelta = pState->dirtyLineDelta;
+
+        // Calculate how many logical lines we are replacing (from the OLD state)
+        // If delta > 0 (lines added), we are replacing 1 old line with (1+delta) new lines.
+        // If delta < 0 (lines removed), we are replacing (1+abs(delta)) old lines with 1 new line.
+        // Wait, if we edit line 5, and insert newline, we re-wrap line 5 and 6.
+        // Let's keep it simple: We re-wrap from startLogLine to startLogLine + (1 + max(0, delta)).
+        // We stop re-wrapping when we hit a logical line that hasn't changed? 
+        // No, we rely on the caller to tell us the delta.
+        // We re-wrap the *entire affected logical block*.
+        
+        // The number of NEW logical lines to verify/wrap is:
+        size_t linesToWrap = 1; 
+        if (shiftDelta > 0) linesToWrap += shiftDelta;
+        
+        endLogLine = startLogLine + linesToWrap;
+        if (endLogLine > pState->pDoc->line_count) endLogLine = pState->pDoc->line_count;
+
+        // 1. Find where to start in visualLines (Binary Search)
+        size_t low = 0, high = pState->visualLineCount;
+        removeStartIdx = pState->visualLineCount;
+        while (low < high) {
+            size_t mid = low + (high - low) / 2;
+            if (pState->visualLines[mid].logicalLine >= startLogLine) {
+                removeStartIdx = mid;
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        insertPos = removeStartIdx;
+
+        // 2. Determine Y start
+        if (insertPos > 0) {
+            VisualLineInfo* prev = &pState->visualLines[insertPos - 1];
+            currentY = prev->yPosition + pState->lineHeight;
+        }
+
+        // 3. Find end of removal range
+        // The old logical range was [startLogLine, startLogLine + 1 - min(0, delta)]
+        size_t oldLogRangeEnd = startLogLine + 1;
+        if (shiftDelta < 0) oldLogRangeEnd += (-shiftDelta);
+
+        removeEndIdx = removeStartIdx;
+        while (removeEndIdx < pState->visualLineCount && 
+               pState->visualLines[removeEndIdx].logicalLine < oldLogRangeEnd) {
+            removeEndIdx++;
+        }
+        
+    } else {
+        // Full Rebuild
+        if (!pState->visualLines) {
+            pState->visualLineCapacity = 1024;
+            pState->visualLines = (VisualLineInfo*)malloc(pState->visualLineCapacity * sizeof(VisualLineInfo));
+        }
+        pState->visualLineCount = 0;
+        isIncremental = FALSE; // Enforce
+    }
+
+    // Process the target logical lines
+    // We use a temporary buffer for the new lines so we don't mess up the main array yet
+    if (isIncremental) {
+        newLinesCap = 64; // Small batch usually
+        newLines = (VisualLineInfo*)malloc(newLinesCap * sizeof(VisualLineInfo));
+    }
+
+    for (size_t logLine = startLogLine; logLine < endLogLine; logLine++) {
         size_t lineStart = 0, lineEnd = 0;
         WCHAR* buf = NULL;
         size_t dLen = 0;
@@ -101,76 +204,79 @@ static void RebuildWrapCache(HWND hwnd, ViewState* pState) {
         if (!View_LoadLine(pState, logLine, &lineStart, &lineEnd, &buf, &dLen)) continue;
 
         size_t pos = 0;
+        BOOL firstPass = TRUE;
 
-        while (pos < dLen) {
-            // Grow array if needed
-            if (pState->visualLineCount >= pState->visualLineCapacity) {
-                pState->visualLineCapacity *= 2;
-                VisualLineInfo* newArray = (VisualLineInfo*)realloc(
-                    pState->visualLines, 
-                    pState->visualLineCapacity * sizeof(VisualLineInfo)
-                );
-                if (!newArray) {
-                    free(buf);
-                    ReleaseDC(hwnd, hdc);
-                    pState->wrapCacheValid = FALSE;
-                    return;
+        while (pos < dLen || firstPass) {
+            firstPass = FALSE;
+
+            // Determine where to write
+            VisualLineInfo* vLine;
+            if (isIncremental) {
+                if (newLinesCount >= newLinesCap) {
+                    newLinesCap *= 2;
+                    VisualLineInfo* tmp = (VisualLineInfo*)realloc(newLines, newLinesCap * sizeof(VisualLineInfo));
+                    if (!tmp) { free(buf); free(newLines); ReleaseDC(hwnd, hdc); return; } // Error
+                    newLines = tmp;
                 }
-                pState->visualLines = newArray;
+                vLine = &newLines[newLinesCount++];
+            } else {
+                if (pState->visualLineCount >= pState->visualLineCapacity) {
+                    pState->visualLineCapacity *= 2;
+                    VisualLineInfo* tmp = (VisualLineInfo*)realloc(pState->visualLines, pState->visualLineCapacity * sizeof(VisualLineInfo));
+                    if (!tmp) { free(buf); ReleaseDC(hwnd, hdc); return; } // Error
+                    pState->visualLines = tmp;
+                }
+                vLine = &pState->visualLines[pState->visualLineCount++];
             }
 
-            // Find how much text fits on this visual line
+            // --- TEXT MEASUREMENT (Same as before) ---
             size_t fitLen = 0;
             size_t remaining = dLen - pos;
-            size_t low = 1;
-            size_t high = remaining;
-            size_t bestFit = 0;
+            
+            if (remaining == 0) {
+                fitLen = 0;
+            } else {
+                size_t low = 1;
+                size_t high = remaining;
+                size_t bestFit = 0;
 
-            // Binary search for the longest string that fits
-            while (low <= high) {
-                size_t mid = low + (high - low) / 2;
-                DWORD extent = GetTabbedTextExtentW(hdc, buf + pos, (int)mid, 1, &tabStops);
-                int width = LOWORD(extent);
-
-                if (width <= wrapWidth) {
-                    bestFit = mid;
-                    low = mid + 1;
-                } else {
-                    high = mid - 1;
-                }
-            }
-
-            fitLen = bestFit;
-
-            // If we can't fit the rest of the line, we need to wrap
-            if (fitLen < remaining) {
-                // Scan backwards for a word boundary
-                BOOL foundBreak = FALSE;
-                for (size_t i = fitLen; i > 0; i--) {
-                    WCHAR ch = buf[pos + i - 1];
-                    if (ch == L' ' || ch == L'\t' || ch == L'-') {
-                        fitLen = i;
-                        foundBreak = TRUE;
-                        break;
+                // Binary search for longest fit
+                while (low <= high) {
+                    size_t mid = low + (high - low) / 2;
+                    DWORD extent = GetTabbedTextExtentW(hdc, buf + pos, (int)mid, 1, &tabStops);
+                    int width = LOWORD(extent);
+                    if (width <= wrapWidth) {
+                        bestFit = mid;
+                        low = mid + 1;
+                    } else {
+                        high = mid - 1;
                     }
                 }
-                // If no boundary found, force break at the limit
-                if (!foundBreak && fitLen == 0) fitLen = 1;
-            } else {
-                fitLen = remaining;
+                fitLen = bestFit;
+
+                if (fitLen < remaining) {
+                    BOOL foundBreak = FALSE;
+                    for (size_t i = fitLen; i > 0; i--) {
+                        WCHAR ch = buf[pos + i - 1];
+                        if (ch == L' ' || ch == L'\t' || ch == L'-') {
+                            fitLen = i;
+                            foundBreak = TRUE;
+                            break;
+                        }
+                    }
+                    if (!foundBreak && fitLen == 0) fitLen = 1;
+                } else {
+                    fitLen = remaining;
+                }
             }
 
-            // Skip leading spaces on wrapped lines
             size_t skipLeading = 0;
             if (pos > 0) {
-                while (skipLeading < fitLen && 
-                       (buf[pos + skipLeading] == L' ' || buf[pos + skipLeading] == L'\t')) {
+                while (skipLeading < fitLen && (buf[pos + skipLeading] == L' ' || buf[pos + skipLeading] == L'\t')) {
                     skipLeading++;
                 }
             }
 
-            // Record this visual line
-            VisualLineInfo* vLine = &pState->visualLines[pState->visualLineCount++];
             vLine->logicalLine = logLine;
             vLine->startOffset = pos + skipLeading;
             vLine->length = (fitLen > skipLeading) ? (fitLen - skipLeading) : 0;
@@ -179,24 +285,68 @@ static void RebuildWrapCache(HWND hwnd, ViewState* pState) {
             pos += fitLen;
             currentY += pState->lineHeight;
         }
+        free(buf);
+    }
 
-        // Handle empty lines
-        if (dLen == 0) {
-            VisualLineInfo* vLine = &pState->visualLines[pState->visualLineCount++];
-            vLine->logicalLine = logLine;
-            vLine->startOffset = 0;
-            vLine->length = 0;
-            vLine->yPosition = currentY;
-            currentY += pState->lineHeight;
+    // Merge logic for Incremental
+    if (isIncremental) {
+        size_t removedCount = removeEndIdx - removeStartIdx;
+        long visualCountDelta = (long)newLinesCount - (long)removedCount;
+        
+        // Calculate Y shift for subsequent lines
+        if (removeEndIdx < pState->visualLineCount) {
+             int oldNextY = pState->visualLines[removeEndIdx].yPosition;
+             yShift = currentY - oldNextY;
         }
 
-        free(buf);
+        // Resize main array if needed
+        size_t neededSize = pState->visualLineCount + visualCountDelta;
+        if (neededSize > pState->visualLineCapacity) {
+             pState->visualLineCapacity = neededSize + 128; // Add some slack
+             VisualLineInfo* tmp = (VisualLineInfo*)realloc(pState->visualLines, pState->visualLineCapacity * sizeof(VisualLineInfo));
+             if (!tmp) { free(newLines); ReleaseDC(hwnd, hdc); return; } // Error recovery?
+             pState->visualLines = tmp;
+        }
+
+        // Shift tail
+        if (visualCountDelta != 0 && removeEndIdx < pState->visualLineCount) {
+             memmove(pState->visualLines + removeEndIdx + visualCountDelta,
+                     pState->visualLines + removeEndIdx,
+                     (pState->visualLineCount - removeEndIdx) * sizeof(VisualLineInfo));
+        }
+
+        // Copy new lines into gap
+        if (newLinesCount > 0) {
+            memcpy(pState->visualLines + removeStartIdx, newLines, newLinesCount * sizeof(VisualLineInfo));
+        }
+
+        free(newLines);
+        pState->visualLineCount = neededSize;
+
+        // Fixup tail (logical indices and Y positions)
+        size_t tailStart = removeEndIdx + visualCountDelta;
+        for (size_t i = tailStart; i < pState->visualLineCount; i++) {
+            pState->visualLines[i].logicalLine += shiftDelta;
+            pState->visualLines[i].yPosition += yShift;
+        }
+        
+    } else {
+        // For full rebuild, just continue the loop if we broke it up (we didn't).
+        // Actually, the loop above was for incremental range.
+        // If !isIncremental, we should have looped 0 to pDoc->line_count.
+        // The loop used 'startLogLine' to 'endLogLine'.
+        // For !isIncremental, we set startLogLine=0, endLogLine=pDoc->line_count.
+        // So the loop logic works for both.
     }
 
     ReleaseDC(hwnd, hdc);
     pState->cachedWrapWidth = wrapWidth;
-    pState->cachedDocGeneration = pState->docGeneration;  // Mark which document this cache is for
+    pState->cachedDocGeneration = pState->docGeneration;
     pState->wrapCacheValid = TRUE;
+    
+    // Reset dirty state
+    pState->firstDirtyLine = SIZE_MAX;
+    pState->dirtyLineDelta = 0;
 }
 
 static int GetCommandPromptTopY(ViewState* pState) {
@@ -250,9 +400,10 @@ static void SetCommandFeedback(ViewState* pState, const WCHAR* text, int caretCo
 }
 
 // Maximum pixel width of unwrapped content (includes 5px inset on each side)
-static int View_GetDocumentWidth(HWND hwnd, ViewState* pState) {
-    if (!pState || !pState->pDoc || pState->bWordWrap) return 0;
-
+// Full max-line-width scan (the only path that's O(document size)). Called at most once
+// per load/paste/undo/redo/wrap-toggle - see View_GetDocumentWidth and
+// View_GrowDocWidthForLine, which keep this from re-running on every keystroke.
+static int View_ScanDocumentWidth(HWND hwnd, ViewState* pState) {
     HDC hdc = GetDC(hwnd);
     SelectObject(hdc, pState->hFont);
     TEXTMETRIC tm;
@@ -273,6 +424,47 @@ static int View_GetDocumentWidth(HWND hwnd, ViewState* pState) {
     ReleaseDC(hwnd, hdc);
     // 5px inset on each side to match draw origin of 5
     return maxWidth + 10;
+}
+
+// Returns the width (in pixels) of the widest line, for the horizontal scrollbar range in
+// unwrapped mode. Cached: recomputing this by scanning every line is expensive (it was
+// previously done on every keystroke via UpdateScrollbars, making typing in unwrapped mode
+// on a file of any real size cost tens to hundreds of milliseconds per character). The
+// cache is safe to be stale-high (see View_GrowDocWidthForLine) - overestimating the widest
+// line just makes the scrollbar allow scrolling a bit further than strictly necessary,
+// while underestimating would hide content, so we never shrink it incrementally.
+static int View_GetDocumentWidth(HWND hwnd, ViewState* pState) {
+    if (!pState || !pState->pDoc || pState->bWordWrap) return 0;
+
+    if (!pState->docWidthValid) {
+        pState->cachedDocWidth = View_ScanDocumentWidth(hwnd, pState);
+        pState->docWidthValid = TRUE;
+    }
+    return pState->cachedDocWidth;
+}
+
+// Cheaply keeps the cached document width in sync with a single-line edit (typing one
+// character) by measuring just that one line, instead of rescanning the whole document.
+// Only ever grows the cache - see View_GetDocumentWidth for why that's safe.
+static void View_GrowDocWidthForLine(HWND hwnd, ViewState* pState, size_t lineIndex) {
+    if (!pState->docWidthValid || pState->bWordWrap) return;
+
+    WCHAR* buf = NULL;
+    size_t dLen = 0;
+    if (!View_LoadLine(pState, lineIndex, NULL, NULL, &buf, &dLen)) return;
+
+    HDC hdc = GetDC(hwnd);
+    SelectObject(hdc, pState->hFont);
+    TEXTMETRIC tm;
+    GetTextMetrics(hdc, &tm);
+    int tabStops = tm.tmAveCharWidth * 4;
+
+    DWORD extent = GetTabbedTextExtentW(hdc, buf, (int)dLen, 1, &tabStops);
+    int width = (int)LOWORD(extent) + 10;
+    if (width > pState->cachedDocWidth) pState->cachedDocWidth = width;
+
+    ReleaseDC(hwnd, hdc);
+    free(buf);
 }
 
 // Returns TRUE when a non-empty selection exists; outputs start/len
@@ -773,6 +965,10 @@ void View_SetDocument(HWND hwnd, SlateDoc* pDoc) {
         // Increment generation to invalidate all caches
         pState->docGeneration++;
         pState->wrapCacheValid = FALSE;
+        pState->firstDirtyLine = SIZE_MAX;
+        pState->dirtyLineDelta = 0;
+        pState->docWidthValid = FALSE;
+        pState->cachedDocWidth = 0;
 
         // Ensure document's line map is initialized before wrapping
         if (pDoc && pDoc->line_count > 0) {
@@ -976,7 +1172,9 @@ void View_Undo(HWND hwnd) {
     if (Doc_Undo(pState->pDoc, pState->cursorOffset, &restoredCursor)) {
         pState->cursorOffset = restoredCursor;
         pState->selectionAnchor = restoredCursor;
-        
+        // The whole piece list was swapped wholesale - any line could have changed width.
+        pState->docWidthValid = FALSE;
+
         // Ensure the screen follows the cursor after the undo
         EnsureCursorVisible(hwnd, pState);
         InvalidateRect(hwnd, NULL, FALSE);
@@ -992,7 +1190,9 @@ void View_Redo(HWND hwnd) {
     if (Doc_Redo(pState->pDoc, pState->cursorOffset, &restoredCursor)) {
         pState->cursorOffset = restoredCursor;
         pState->selectionAnchor = restoredCursor;
-        
+        // The whole piece list was swapped wholesale - any line could have changed width.
+        pState->docWidthValid = FALSE;
+
         // Ensure the screen follows the cursor after the redo
         EnsureCursorVisible(hwnd, pState);
         InvalidateRect(hwnd, NULL, FALSE);
@@ -1069,6 +1269,10 @@ void View_Paste(HWND hwnd) {
                 size_t pasteLen = wcslen(pText);
                 Doc_Insert(pState->pDoc, pState->cursorOffset, pText, pasteLen);
                 pState->wrapCacheValid = FALSE;
+                // Pasted content can span multiple lines and introduce a long line anywhere
+                // in it, not just at the cursor - invalidate rather than incrementally grow;
+                // this is a one-time rescan on the next need, not a per-keystroke cost.
+                pState->docWidthValid = FALSE;
                 pState->cursorOffset += pasteLen;
                 pState->selectionAnchor = pState->cursorOffset;
                 
@@ -1127,6 +1331,9 @@ void View_SetWordWrap(HWND hwnd, BOOL bWrap) {
     if (pState && pState->bWordWrap != bWrap) {
         pState->bWordWrap = bWrap;
         pState->wrapCacheValid = FALSE;  // Invalidate cache
+        // Edits made while word-wrapped don't update the doc-width cache (it's unused in
+        // that mode), so it may be stale by the time we switch back to unwrapped mode.
+        pState->docWidthValid = FALSE;
         pState->scrollY = 0;
         pState->scrollX = 0;
         UpdateScrollbars(hwnd, pState);
@@ -1398,7 +1605,11 @@ static LRESULT HandleCreate(HWND hwnd) {
     pState->visualLineCapacity = 0;
     pState->cachedWrapWidth = 0;
     pState->wrapCacheValid = FALSE;
-    pState->docGeneration = 0; 
+    pState->cachedDocWidth = 0;
+    pState->docWidthValid = FALSE;
+    pState->firstDirtyLine = SIZE_MAX;
+    pState->dirtyLineDelta = 0;
+    pState->docGeneration = 0;  
     pState->cachedDocGeneration = 0; 
     
     // 2. Create Font
@@ -1854,11 +2065,26 @@ static LRESULT HandleChar(HWND hwnd, ViewState* pState, WPARAM wParam) {
     if (c == L'\r' || c == L'\n' || (c >= 32) || c == L'\t') {
         if (c == L'\r') c = L'\n'; // Normalize to LF
 
+        // Capture initial state for incremental update
+        size_t oldLineCount = pState->pDoc->line_count;
+        size_t changeStartLine = 0;
+        {
+            // Determine where the change starts (min of cursor or selection start)
+            size_t startOff = pState->cursorOffset;
+            size_t sStart, sLen;
+            if (View_GetSelection(pState, &sStart, &sLen)) {
+                if (sStart < startOff) startOff = sStart;
+            }
+            int l, col;
+            Doc_GetOffsetInfo(pState->pDoc, startOff, &l, &col);
+            changeStartLine = (l > 0) ? l - 1 : 0;
+        }
+
         // Replace any highlighted selection with the typed character
         size_t selStart = 0, selLen = 0;
         if (View_GetSelection(pState, &selStart, &selLen)) {
             Doc_Delete(pState->pDoc, selStart, selLen);
-            pState->wrapCacheValid = FALSE;
+            // pState->wrapCacheValid = FALSE; // Handled by Notify below
             pState->cursorOffset = pState->selectionAnchor = selStart;
         } else if (!pState->bInsertMode && c != L'\n') {
             // Overtype logic: Remove the next character if we aren't at EOF
@@ -1868,14 +2094,24 @@ static LRESULT HandleChar(HWND hwnd, ViewState* pState, WPARAM wParam) {
                 // Don't overtype the newline; it preserves the document's line structure
                 if (nextChar != L'\n') {
                     Doc_Delete(pState->pDoc, pState->cursorOffset, 1);
-                    pState->wrapCacheValid = FALSE;
+                    // pState->wrapCacheValid = FALSE;
                 }
             }
         }
 
         // Insert the character and collapse the selection/anchor
         Doc_Insert(pState->pDoc, pState->cursorOffset, &c, 1);
-        pState->wrapCacheValid = FALSE;
+
+        // Notify incremental update
+        long delta = (long)pState->pDoc->line_count - (long)oldLineCount;
+        View_NotifyContentChange(pState, changeStartLine, delta);
+
+        // A single non-newline character can only make its own line wider, never any
+        // other line - cheap to keep the doc-width cache in sync without a full rescan.
+        if (c != L'\n') {
+            View_GrowDocWidthForLine(hwnd, pState, changeStartLine);
+        }
+
         pState->cursorOffset++;
         pState->selectionAnchor = pState->cursorOffset;
 

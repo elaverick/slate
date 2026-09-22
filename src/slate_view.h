@@ -66,6 +66,15 @@ typedef struct {
     size_t visualLineCapacity;
     int cachedWrapWidth;
     BOOL wrapCacheValid;
+    
+    // Incremental wrap cache state
+    size_t firstDirtyLine;     // Logical line index where change started (SIZE_MAX if none/full rebuild)
+    long dirtyLineDelta;       // Change in document line count (+N or -N)
+
+    // Cached max line width (unwrapped mode's horizontal scrollbar range). Only ever safe
+    // to grow incrementally without a full rescan - see View_GetDocumentWidth.
+    int cachedDocWidth;
+    BOOL docWidthValid;
 } ViewState;
 
 // Register the custom "SlateView" window class

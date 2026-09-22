@@ -80,6 +80,39 @@ static size_t Utf8ByteOffsetForUnits(const unsigned char* buf, size_t byteStart,
     return i;
 }
 
+// Counts the total number of UTF-16 units a (possibly huge) UTF-8 byte buffer decodes
+// to. MultiByteToWideChar takes `int` lengths, so for buffers at or beyond INT_MAX bytes
+// (a real case for the multi-gigabyte files this editor is meant to handle) a single call
+// would either fail outright or silently misbehave from the byte count truncating/
+// wrapping when cast to int. Process in bounded chunks instead, each backed off to a
+// UTF-8 character boundary so no multi-byte sequence gets split across chunk edges.
+static size_t Utf8CountUnitsChunked(const unsigned char* buf, size_t byteLen) {
+    // MultiByteToWideChar hard-fails (ERROR_INVALID_PARAMETER) for a single call at or
+    // above 1 GiB, well under INT_MAX - empirically confirmed (512 MiB succeeds, 1 GiB
+    // does not). Stay well clear of that undocumented cliff.
+    const size_t CHUNK_LIMIT = 0x10000000; // 256 MiB
+    size_t total = 0;
+    size_t pos = 0;
+
+    while (pos < byteLen) {
+        size_t remaining = byteLen - pos;
+        size_t chunkEnd = (remaining > CHUNK_LIMIT) ? (pos + CHUNK_LIMIT) : byteLen;
+
+        if (chunkEnd < byteLen) {
+            size_t original = chunkEnd;
+            while (chunkEnd > pos && (buf[chunkEnd] & 0xC0) == 0x80) chunkEnd--;
+            if (chunkEnd == pos) chunkEnd = original; // pathological run of continuation bytes - just cut here
+        }
+
+        int units = MultiByteToWideChar(CP_UTF8, 0, (const char*)buf + pos, (int)(chunkEnd - pos), NULL, 0);
+        if (units > 0) total += (size_t)units;
+
+        pos = chunkEnd;
+    }
+
+    return total;
+}
+
 static Piece* SplitPiece(SlateDoc* doc, size_t offset) {
     if (offset == 0) return doc->head;
     if (offset >= doc->total_length) return NULL;
@@ -496,10 +529,10 @@ SlateDoc* Doc_CreateFromMap(void* pMappedText, size_t len, HANDLE hMap, void* pB
 
     // For UTF-8, `len` is the raw byte count; the piece's LOGICAL length (in UTF-16
     // units, as used by every offset calculation elsewhere) must be decoded up front.
+    // Chunked to stay correct for files at or beyond INT_MAX bytes.
     size_t logicalLen = len;
     if (isUtf8 && len > 0) {
-        int units = MultiByteToWideChar(CP_UTF8, 0, (const char*)pMappedText, (int)len, NULL, 0);
-        logicalLen = (units > 0) ? (size_t)units : 0;
+        logicalLen = Utf8CountUnitsChunked((const unsigned char*)pMappedText, len);
     }
 
     doc->head = CreatePiece(BUFFER_ORIGINAL, 0, logicalLen, len, isUtf8);
